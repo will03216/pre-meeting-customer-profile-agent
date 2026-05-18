@@ -1290,6 +1290,33 @@ def extract_pricing_tiers(text: str) -> list[str]:
     return tiers[:8]
 
 
+def customer_related_pricing_text(company_name: str | None, enrichment_description: str, web_results: list[dict[str, str]], pages: list[dict[str, Any]]) -> str:
+    blocked_hosts = ("openai.com", "claude.com", "anthropic.com")
+    person_company_terms = ("fabien", "siderakis", "lamethodepapier", "la methode papier", "la méthode papier")
+    parts = [enrichment_description]
+    for item in web_results:
+        url = item.get("url", "")
+        host = urlparse(url).netloc.lower()
+        if any(blocked in host for blocked in blocked_hosts):
+            continue
+        haystack = f"{item.get('title', '')} {item.get('snippet', '')} {url}".lower()
+        if company_name and not likely_official_web_result(item, company_name) and company_name.lower() not in haystack:
+            continue
+        if not company_name and not any(term in haystack for term in person_company_terms):
+            continue
+        parts.append(f"{item.get('title', '')} {item.get('snippet', '')}")
+    for page in pages:
+        url = page.get("url", "")
+        host = urlparse(url).netloc.lower()
+        if any(blocked in host for blocked in blocked_hosts):
+            continue
+        haystack = f"{page.get('title', '')} {page.get('snippet', '')} {url}".lower()
+        if not company_name and not any(term in haystack for term in person_company_terms):
+            continue
+        parts.append(page.get("text", ""))
+    return " ".join(parts)
+
+
 def extract_company_dossier(
     company_name: str | None,
     enrichment_description: str,
@@ -1320,7 +1347,7 @@ def extract_company_dossier(
         if any(needle in lowered for needle in needles):
             modules.append(label)
 
-    pricing_tiers = extract_pricing_tiers(combined)
+    pricing_tiers = extract_pricing_tiers(customer_related_pricing_text(company_name, enrichment_description, web_results, pages))
     scale_signals = []
     for pattern in [
         r"over\s+[\d.]+\s*(?:million|m|k)\s+active users",
@@ -1365,6 +1392,12 @@ def extract_company_dossier(
     social_content_presence = ""
     if any(term in lowered for term in ("paid media", "ad creative", "landing page", "creative testing", "paid social")):
         social_content_presence = "paid media / landing-page creative workflow signal found"
+    candidate_company = ""
+    if not company_name:
+        if "la methode papier" in lowered or "la méthode papier" in lowered:
+            candidate_company = "La Methode Papier"
+        elif "siderakis fabien" in lowered:
+            candidate_company = "Siderakis Fabien"
 
     source_evidence = []
     for item in sorted(web_results[:8], key=lambda x: source_tier(x.get("url", ""), company_name)[0]):
@@ -1391,6 +1424,7 @@ def extract_company_dossier(
         "traffic_source_scale": traffic_source_scale,
         "business_model": business_model,
         "social_content_presence": social_content_presence,
+        "candidate_company": candidate_company,
         "source_evidence": source_evidence[:8],
         "not_found": [
             item

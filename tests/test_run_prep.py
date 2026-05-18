@@ -676,6 +676,61 @@ def test_pricing_packaging_is_cautious_for_public_packaging() -> None:
     assert "Likely: Team; Business" not in rendered
 
 
+def test_weak_identity_output_does_not_leak_previous_customer_name() -> None:
+    payload = base_render_payload()
+    payload["customer"]["name"] = "Fabien Siderakis"
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    rendered = render_prep_doc.render(payload)
+    assert "Fabien Siderakis" in rendered
+    assert "David Agronov" not in rendered
+
+
+def test_unknown_vertical_uses_neutral_leadership_fields() -> None:
+    payload = base_render_payload()
+    payload["customer"]["name"] = "Fabien Siderakis"
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["enrichment"] = {"available": True, "dossier": {}}
+    rendered = render_prep_doc.render(payload)
+    assert "high-intent consumers" not in rendered
+    assert "brand/advertiser partners" not in rendered
+    assert "intent-marketing / comparison-platform model" not in rendered
+    assert "Target Users / Customer Segments | To Validate: target users/customer segments are not confirmed" in rendered
+    assert "Business Model / Revenue Model | To Validate: business model/revenue model is not confirmed" in rendered
+
+
+def test_competitor_pricing_pages_do_not_populate_customer_pricing() -> None:
+    dossier = run_prep.extract_company_dossier(
+        None,
+        "Fabien Siderakis public profile",
+        [],
+        [
+            {"title": "Plans & Pricing | Claude by Anthropic", "url": "https://claude.com/pricing", "snippet": "Free, Pro, Team, and Enterprise tiers"},
+            {"title": "API Pricing - OpenAI", "url": "https://openai.com/api/pricing/", "snippet": "Compare token costs and service tiers"},
+            {"title": "Anthropic enterprise analytics", "url": "https://www.finout.io/blog/anthropics-enterprise-analytics", "snippet": "Enterprise and Business pricing analysis"},
+        ],
+        [],
+    )
+    assert dossier["pricing_tiers"] == []
+
+
+def test_person_only_candidate_company_is_likely_and_to_validate() -> None:
+    dossier = run_prep.extract_company_dossier(
+        None,
+        "Fabien Siderakis is associated with LA METHODE PAPIER.",
+        [],
+        [{"title": "Mentions legales", "url": "https://lamethodepapier.com", "snippet": "Siderakis Fabien LA METHODE PAPIER"}],
+        [],
+    )
+    assert dossier["candidate_company"] == "La Methode Papier"
+
+    payload = base_render_payload()
+    payload["customer"]["name"] = "Fabien Siderakis"
+    payload["enrichment"] = {"available": True, "dossier": dossier}
+    rendered = render_prep_doc.render(payload)
+    assert "Candidate Company / Product | Likely: La Methode Papier (?)" in rendered
+    assert "Confirm whether the meeting is for Fabien Siderakis personally, La Methode Papier, or another company/product" in rendered
+
+
 def test_prior_docs_attribution_distinguishes_candidate_from_usable() -> None:
     payload = base_render_payload()
     payload["prior_docs"] = [{"title": "BytePlus <> David - Pre-Meeting Prep", "url": "https://doc.example", "summary": "Web search results: https://example.com"}]

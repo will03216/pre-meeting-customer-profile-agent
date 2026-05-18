@@ -204,6 +204,10 @@ def pricing_packaging_note(pricing_tiers: list | None) -> str:
     return "pricing or packaging was not found; actual AI infrastructure spend, budget owner, and BytePlus-relevant commitment are unknown"
 
 
+def unknown_vertical(vertical: dict) -> bool:
+    return (vertical.get("name") in {None, "", "default"}) and (vertical.get("confidence") in {None, "", "unknown", "weak"})
+
+
 def source_attribution(data: dict) -> str:
     prior_docs = data.get("prior_docs") or []
     used_prior_docs = usable_prior_docs(prior_docs)
@@ -308,21 +312,24 @@ def company_dossier_section(data: dict) -> str:
     dossier = enrichment.get("dossier") or {}
     source = best_evidence_url(data)
     vertical = data.get("vertical") or {}
-    target_users = dossier.get("target_users") or "high-intent consumers and brand/advertiser partners are relevant based on intent-marketing and comparison-platform positioning"
+    is_unknown_vertical = unknown_vertical(vertical)
+    target_users = dossier.get("target_users") or ("target users/customer segments are not confirmed from available sources" if is_unknown_vertical else "high-intent consumers and brand/advertiser partners are relevant based on intent-marketing and comparison-platform positioning")
     traffic, traffic_label = traffic_source_note(dossier.get("traffic_source_scale"))
-    business_model = dossier.get("business_model") or "intent-marketing / comparison-platform model connecting consumers with brands"
+    business_model = dossier.get("business_model") or ("business model/revenue model is not confirmed from available sources" if is_unknown_vertical else "intent-marketing / comparison-platform model connecting consumers with brands")
     social_presence = dossier.get("social_content_presence") or "no confirmed social or paid-media creative workflow from current sources"
-    stakeholder = "David Agronov's role, buying authority, and technical/commercial ownership are not confirmed"
+    customer_name = customer.get("name") or "the customer"
+    stakeholder = f"{customer_name}'s role, buying authority, and technical/commercial ownership are not confirmed"
     rows = [
         ("Company / Brand", dossier.get("company") or customer.get("company_name") or customer.get("name")),
+        ("Candidate Company / Product", labeled_text(dossier.get("candidate_company"), "likely", fallback="To Validate: confirm whether this meeting is for the person, a company, or a product.", followup=f"Confirm whether the meeting is for {customer_name} personally, {dossier.get('candidate_company') or 'a candidate company/product'}, or another company/product.")),
         ("Website", labeled_text(customer.get("website"), "known", fallback=TO_VALIDATE)),
         ("What They Do", labeled_text(dossier.get("what_they_do") or customer.get("description"), "known" if source else "to_validate", fallback=TO_VALIDATE, evidence=source)),
         ("Detected Industry", labeled_text(vertical.get("display_name"), "known" if vertical.get("confidence") == "confirmed" else ("likely" if vertical.get("confidence") in {"likely", "weak"} else "to_validate"), fallback=TO_VALIDATE, evidence=join_non_empty(vertical.get("evidence")))),
         ("Product Modules", labeled_text(dossier.get("product_modules"), "likely", fallback="Not Found: no product modules found")),
-        ("Target Users / Customer Segments", labeled_text(target_users, "likely", followup="Who are the main users or customers: consumers, advertisers, enterprise clients, SMBs, or internal teams?")),
+        ("Target Users / Customer Segments", labeled_text(target_users, "to_validate" if is_unknown_vertical and not dossier.get("target_users") else "likely", followup="Who are the main users or customers: consumers, advertisers, enterprise clients, SMBs, or internal teams?")),
         ("Traffic Source / Scale", labeled_text(traffic, traffic_label, followup="Which channels drive most traffic today, and what is the monthly traffic or qualified-lead volume?")),
         ("Key Stakeholders / Buying Role", labeled_text(stakeholder, "to_validate", followup="Could you confirm your role in this evaluation and who owns the technical and commercial decision?")),
-        ("Business Model / Revenue Model", labeled_text(business_model, "likely", followup="Is the revenue model mainly lead generation, affiliate/referral, advertising, subscription, or enterprise partnerships?")),
+        ("Business Model / Revenue Model", labeled_text(business_model, "to_validate" if is_unknown_vertical and not dossier.get("business_model") else "likely", followup="Is the revenue model mainly lead generation, affiliate/referral, advertising, subscription, or enterprise partnerships?")),
         ("Social / Content / Paid Media Presence", labeled_text(social_presence, "not_found" if not dossier.get("social_content_presence") else "likely", followup="Do you produce paid social, landing page, image, or video creative at scale?")),
         ("Pricing / Packaging", labeled_text(pricing_packaging_note(dossier.get("pricing_tiers")), "to_validate")),
         ("Scale Signals", labeled_text(dossier.get("scale_signals"), "likely", fallback="Not Found: no scale signals found")),
