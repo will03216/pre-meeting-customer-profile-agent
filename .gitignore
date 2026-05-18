@@ -1,0 +1,9 @@
+.env
+*.token
+data/oauth_tokens/
+outputs/prep/
+.cache/
+__pycache__/
+.pytest_cache/
+*.pyc
+artifacts/

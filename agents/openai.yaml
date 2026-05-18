@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pre-Meeting Customer Profile"
+  short_description: "Draft customer prep docs before meetings"
+  default_prompt: "Use $pre-meeting-customer-profile to prepare a BytePlus customer profile draft for my upcoming customer meetings."
