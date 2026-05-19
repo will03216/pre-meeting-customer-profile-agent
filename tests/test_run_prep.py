@@ -200,6 +200,7 @@ def test_web_search_source_attribution_may_mention_web_search() -> None:
         "known_use_cases": ["Likely: image generation and creative asset editing (?)"],
         "possible_byteplus_fit": [{"product": "Seedream", "reason": "Validate image generation fit"}],
     }
+    payload["vertical"] = {"name": "ai_video_creative", "display_name": "AI Video / Creative", "confidence": "likely", "evidence": ["image generation"]}
     payload["search_results"] = [{"title": "ImagineArt", "url": "https://www.imagine.art/", "source": "web"}]
     rendered = render_prep_doc.render(payload)
     assert "## Executive Prep Snapshot" in rendered
@@ -409,6 +410,8 @@ def test_official_web_result_chosen_over_directory_site() -> None:
     assert run_prep.stable_company_website("docs.imagine.art") == "imagine.art"
     assert "generative AI creative platform" in run_prep.stable_company_description("ImagineArt", "Monetization on ImagineArt Community", ["image generation"])
     assert run_prep.source_tier("https://docs.imagine.art/community/monetization", "ImagineArt")[1] == "Tier 1 - official docs/help"
+    assert run_prep.source_tier("https://docs.fpk2.azadseo.pro/pricing", "Freepik")[1] != "Tier 1 - official docs/help"
+    assert run_prep.classify_source("https://docs.fpk2.azadseo.pro/pricing", "Freepik pricing", "Freepik plans", "Freepik") != "customer_evidence"
 
 
 def test_web_query_expansion_keeps_customer_specific_queries_scoped() -> None:
@@ -650,7 +653,7 @@ def test_scale_signals_backfill_purchase_decisions_from_evidence() -> None:
         "Natural Intelligence",
         "Natural Intelligence is a leader in intent marketing.",
         [],
-        [{"title": "Scale", "url": "https://example.com", "snippet": "over 60 million purchase decisions facilitated annually"}],
+        [{"title": "Natural Intelligence scale", "url": "https://example.com", "snippet": "Natural Intelligence supports over 60 million purchase decisions facilitated annually"}],
         [],
     )
     assert "over 60 million purchase decisions" in dossier["scale_signals"]
@@ -731,6 +734,354 @@ def test_person_only_candidate_company_is_likely_and_to_validate() -> None:
     assert "Confirm whether the meeting is for Fabien Siderakis personally, La Methode Papier, or another company/product" in rendered
 
 
+def test_person_only_weak_identity_is_conservative() -> None:
+    payload = base_render_payload()
+    payload["customer"]["name"] = "Fabien Siderakis"
+    payload["customer_context"] = {"classification": "person_only"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["enrichment"] = {
+        "available": True,
+        "description": "Fabien Siderakis LinkedIn profile. Expérience : LA METHODE PAPIER.",
+        "known_use_cases": ["image generation and creative asset editing", "API or enterprise integration requirements"],
+        "possible_byteplus_fit": [
+            {"product": "Seedance", "reason": "video"},
+            {"product": "Seedream", "reason": "image"},
+            {"product": "Ark / model platform", "reason": "api"},
+        ],
+        "dossier": {"candidate_company": "La Methode Papier", "what_they_do": "Fabien Siderakis LinkedIn profile. Expérience : LA METHODE PAPIER."},
+    }
+    rendered = render_prep_doc.render(payload)
+    assert "David Agronov" not in rendered
+    assert "Candidate Company / Product | Likely: La Methode Papier (?)" in rendered
+    assert "Detected vertical: Default / Unknown (unknown)" in rendered
+    assert "high-intent consumers" not in rendered
+    assert "brand/advertiser partners" not in rendered
+    assert "Key Use Case | To Validate: active AI or BytePlus-relevant workload is not confirmed" in rendered
+    assert "Likely AI workloads: To Validate: active AI or BytePlus-relevant workload is not confirmed" in rendered
+    assert "Seedance: video" not in rendered
+    assert "Seedream: image" not in rendered
+    assert "Ark / model platform: api" not in rendered
+    assert "To Validate: identify active workload first." in rendered
+
+
+def test_noise_sources_do_not_enter_final_evidence_table() -> None:
+    payload = base_render_payload()
+    payload["enrichment"] = {
+        "available": True,
+        "dossier": {
+            "source_evidence": [
+                {"claim": "Claude pricing", "url": "https://claude.com/pricing", "tier_label": "Tier 4", "source_classification": "competitor_reference"},
+                {"claim": "OpenAI pricing", "url": "https://openai.com/api/pricing/", "tier_label": "Tier 4", "source_classification": "competitor_reference"},
+            ]
+        },
+    }
+    rendered = render_prep_doc.render(payload)
+    assert "https://claude.com/pricing" not in rendered
+    assert "https://openai.com/api/pricing/" not in rendered
+
+
+def test_person_linkedin_snippet_is_not_known_company_business() -> None:
+    payload = base_render_payload()
+    payload["customer"]["name"] = "Fabien Siderakis"
+    payload["customer_context"] = {"classification": "person_only"}
+    payload["enrichment"] = {
+        "available": True,
+        "dossier": {"what_they_do": "Hello, c'est Fabien ! Expérience : LA METHODE PAPIER. Consultez le profil sur LinkedIn."},
+        "source_links": [{"url": "https://fr.linkedin.com/in/fabiensiderakis"}],
+    }
+    rendered = render_prep_doc.render(payload)
+    assert "What They Do | Known:" not in rendered
+    assert "What They Do | To Validate: no confirmed company or business was extracted from usable sources." in rendered
+    assert "Hello, c'est Fabien" not in rendered
+
+
+def test_strong_company_case_still_allows_specific_product_fit() -> None:
+    payload = base_render_payload()
+    payload["customer"]["name"] = "David Agronov"
+    payload["customer"]["domain"] = "naturalint.com"
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "marketing_adtech", "display_name": "Marketing / AdTech", "confidence": "confirmed", "evidence": ["Explicit CLI --industry marketing_adtech"]}
+    payload["enrichment"] = {
+        "available": True,
+        "known_use_cases": ["performance marketing and customer acquisition workflow"],
+        "possible_byteplus_fit": [{"product": "Ark / model platform", "reason": "Validate fit for routing and inference"}],
+        "dossier": {"what_they_do": "Natural Intelligence is an intent marketing company."},
+    }
+    rendered = render_prep_doc.render(payload)
+    assert "Ark / model platform: Validate fit for routing and inference" in rendered
+    assert "To Validate: identify active workload first." not in rendered
+
+
+def test_unknown_person_only_risk_pain_points_and_context_confidence_are_conservative() -> None:
+    payload = base_render_payload()
+    payload["customer"]["name"] = "Fabien Siderakis"
+    payload["customer_context"] = {"classification": "person_only"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["enrichment"] = {
+        "available": False,
+        "known_risks": ["Missing confirmed budget, decision maker, timeline, current vendor, and success metrics"],
+        "possible_byteplus_fit": [{"product": "Seedance", "reason": "video"}],
+    }
+    payload["known"] = {"pain_points": "Likely: creative AI teams often care about output quality (?)"}
+    rendered = render_prep_doc.render(payload)
+    assert "Customer Context Confidence | Weak / Person-only input. No confirmed company, domain, calendar event, or active workload found." in rendered
+    assert "Risk | To Validate: budget, decision maker, timeline, current vendor, and success metrics are not confirmed." in rendered
+    assert "Pain Points | To Validate: no confirmed pain point found. Missing budget, decision maker, timeline, current vendor, and success metrics should be validated in the meeting." in rendered
+    assert "Risk | Likely: Missing confirmed" not in rendered
+    assert "Pain Points | Likely: Missing confirmed" not in rendered
+    assert "Likely: Seedance" not in rendered
+    assert "Question Coverage Matrix" not in rendered
+
+
+def test_confirmed_company_context_confidence_remains_rich() -> None:
+    payload = base_render_payload()
+    payload["customer"]["name"] = "David Agronov"
+    payload["customer"]["domain"] = "naturalint.com"
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "marketing_adtech", "display_name": "Marketing / AdTech", "confidence": "confirmed", "evidence": ["Explicit CLI --industry marketing_adtech"]}
+    payload["enrichment"] = {
+        "available": True,
+        "known_use_cases": ["performance marketing and customer acquisition workflow"],
+        "possible_byteplus_fit": [{"product": "Ark / model platform", "reason": "Validate fit for routing and inference"}],
+        "dossier": {"what_they_do": "Natural Intelligence is an intent marketing company."},
+    }
+    rendered = render_prep_doc.render(payload)
+    assert "Customer Context Confidence | Confirmed company context based on domain." in rendered
+    assert "Candidate Company / Product" not in rendered
+    assert "Ark / model platform: Validate fit for routing and inference" in rendered
+
+
+def test_final_weak_identity_gates_core_business_and_vendor_noise_everywhere() -> None:
+    payload = base_render_payload()
+    payload["customer"]["name"] = "Fabien Siderakis"
+    payload["customer"]["description"] = "Hello, c'est Fabien ! Expérience : LA METHODE PAPIER. Consultez le profil sur LinkedIn."
+    payload["customer_context"] = {"classification": "person_only"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["enrichment"] = {
+        "available": True,
+        "description": "Hello, c'est Fabien ! Expérience : LA METHODE PAPIER. Consultez le profil sur LinkedIn.",
+        "known_use_cases": ["image generation and creative asset editing"],
+        "possible_byteplus_fit": [{"product": "Seedance", "reason": "video"}],
+        "dossier": {
+            "what_they_do": "Hello, c'est Fabien ! Expérience : LA METHODE PAPIER. Consultez le profil sur LinkedIn.",
+            "source_evidence": [
+                {"claim": "Claude pricing", "url": "https://claude.com/pricing", "tier_label": "Tier 4", "source_classification": "competitor_reference"},
+                {"claim": "OpenAI pricing", "url": "https://openai.com/api/pricing/", "tier_label": "Tier 4", "source_classification": "competitor_reference"},
+            ],
+        },
+    }
+    rendered = render_prep_doc.render(payload)
+    assert "Core Business | To Validate: no confirmed company or business was extracted from usable sources." in rendered
+    assert "**Core Business Hypothesis:** To Validate: no confirmed company or business was extracted from usable sources." in rendered
+    assert "What They Do | To Validate: no confirmed company or business was extracted from usable sources." in rendered
+    assert "Hello, c'est Fabien" not in rendered
+    assert "https://claude.com/pricing" not in rendered
+    assert "https://openai.com/api/pricing/" not in rendered
+    assert "Likely: Seedance" not in rendered
+
+
+def test_david_confirmed_company_hides_candidate_company_and_stays_rich() -> None:
+    payload = base_render_payload()
+    payload["customer"]["name"] = "David Agronov"
+    payload["customer"]["company_name"] = "Natural Intelligence"
+    payload["customer"]["domain"] = "naturalint.com"
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "marketing_adtech", "display_name": "Marketing / AdTech", "confidence": "confirmed", "evidence": ["Explicit CLI --industry marketing_adtech"]}
+    payload["enrichment"] = {
+        "available": True,
+        "known_use_cases": ["performance marketing and customer acquisition workflow"],
+        "possible_byteplus_fit": [{"product": "Ark / model platform", "reason": "Validate fit for routing and inference"}],
+        "dossier": {
+            "company": "Natural Intelligence",
+            "what_they_do": "Natural Intelligence is a global leader in intent marketing.",
+            "candidate_company": "",
+        },
+    }
+    rendered = render_prep_doc.render(payload)
+    assert "Candidate Company / Product" not in rendered
+    assert "Natural Intelligence is a global leader in intent marketing" in rendered
+    assert "performance marketing and customer acquisition workflow" in rendered
+
+
+def test_freepik_ai_video_creative_playbook_isolated_and_scale_backfilled() -> None:
+    dossier = run_prep.extract_company_dossier(
+        "Freepik",
+        "Freepik is a generative AI creative platform with image generation and video generation.",
+        ["image generation and creative asset editing", "video generation / short-form creative workflow"],
+        [
+            {
+                "title": "Freepik relaunches as Magnific",
+                "url": "https://martechview.com/freepik-relaunches-as-magnific-with-200m-in-revenue/",
+                "snippet": "Freepik has $200M ARR, one million paid subscribers, and 250 enterprise clients.",
+            }
+        ],
+        [],
+    )
+    assert "$200M ARR" in dossier["scale_signals"]
+    assert "one million paid subscribers" in dossier["scale_signals"]
+    assert "250 enterprise clients" in dossier["scale_signals"]
+
+    payload = base_render_payload()
+    payload["customer"]["name"] = "Francisco Castro barea"
+    payload["customer"]["company_name"] = "Freepik"
+    payload["customer"]["domain"] = "freepik.es"
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "ai_video_creative", "display_name": "AI Video / Creative", "confidence": "likely", "evidence": ["Matched signal: image generation", "Matched signal: video generation"]}
+    payload["enrichment"] = {
+        "available": True,
+        "known_use_cases": ["image generation and creative asset editing", "video generation / short-form creative workflow"],
+        "possible_byteplus_fit": [{"product": "Seedream", "reason": "Validate image generation fit"}],
+        "dossier": {
+            **dossier,
+            "traffic_source_scale": "seo; sem",
+            "business_model": "intent-marketing / comparison-platform model connecting consumers with brands",
+            "target_users": "high-intent consumers and brand/advertiser partners",
+        },
+    }
+    rendered = render_prep_doc.render(payload)
+    assert "high-intent consumers" not in rendered
+    assert "comparison-platform model" not in rendered
+    assert "seo; sem" not in rendered
+    assert "creators, designers, marketers, agencies, enterprise creative teams, and API developers" in rendered
+    assert "subscription, credit, API, and enterprise creative-platform packaging" in rendered
+    assert "monthly generations, paid subscribers, enterprise customers, API calls, and web/app usage" in rendered
+    assert "Scale Signals | Likely: $200M ARR; one million paid subscribers; 250 enterprise clients (?)" in rendered
+
+
+def test_fabien_weak_identity_does_not_backfill_unrelated_revenue_scale_or_expansion() -> None:
+    dossier = run_prep.extract_company_dossier(
+        None,
+        "Fabien Siderakis public profile. Expérience : LA METHODE PAPIER.",
+        [],
+        [
+            {"title": "Claude revenue analysis", "url": "https://claude.com/pricing", "snippet": "Anthropic has $1.2 billion revenue."},
+            {"title": "Generic SaaS statistics", "url": "https://example.com/saas-stats", "snippet": "The market reached $6 billion revenue."},
+        ],
+        [],
+        customer_name="Fabien Siderakis",
+    )
+    assert dossier["scale_signals"] == []
+
+    payload = base_render_payload()
+    payload["customer"]["name"] = "Fabien Siderakis"
+    payload["customer_context"] = {"classification": "person_only"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["enrichment"] = {
+        "available": True,
+        "dossier": {**dossier, "product_modules": ["API / enterprise plans"]},
+    }
+    payload["known"] = {"expansion_opportunity": "Likely product modules: API / enterprise plans"}
+    rendered = render_prep_doc.render(payload)
+    assert "Scale Signals | Not Found: no scale signals found" in rendered
+    assert "Expansion Opportunity | To Validate: identify active workload first." in rendered
+    assert "Expansion Opportunity | Likely product modules" not in rendered
+    assert "Question Coverage Matrix" not in rendered
+
+
+def test_contact_company_domain_input_preserves_contact_and_confirms_company() -> None:
+    args = run_prep.parse_args(["--contact", "Liel Oren", "--company", "Apple", "--domain", "apple.com", "--dry-run"])
+    prep_input = run_prep.prep_input_from_args(args)
+    identity = run_prep.resolve_customer(
+        explicit_contact=prep_input.contact,
+        explicit_company=prep_input.company,
+        explicit_domain=prep_input.domain,
+    )
+    assert identity.canonical_name == "Apple"
+    assert identity.domain == "apple.com"
+    assert identity.contact_name == "Liel Oren"
+
+    payload = base_render_payload()
+    payload["customer"] = {
+        "name": "Apple",
+        "contact": "Liel Oren",
+        "domain": "apple.com",
+        "website": "apple.com",
+        "company_name": "Apple",
+        "description": "Apple designs products and services.",
+    }
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["enrichment"] = {"available": True, "dossier": {"company": "Apple", "what_they_do": "Apple designs products and services."}}
+    rendered = render_prep_doc.render(payload)
+    assert "Company / Brand | Apple" in rendered
+    assert "Website | Known: apple.com" in rendered
+    assert "Customer Context Confidence | Confirmed company context based on domain." in rendered
+    assert "Contact / Stakeholder | Liel Oren - To Validate role, buying authority, technical owner, and commercial owner." in rendered
+    assert "Key Stakeholders / Buying Role | To Validate: Liel Oren's role, buying authority, and technical/commercial ownership are not confirmed" in rendered
+    assert "Company / Brand | Liel Oren" not in rendered
+    assert "**Likely Customer / Company:** Liel Oren at Apple" in rendered
+    assert "Apple at Apple" not in rendered
+
+
+def test_confirmed_domain_does_not_use_narrow_api_page_as_company_overview() -> None:
+    results = [
+        {
+            "title": "Enterprise Program API",
+            "url": "https://developer.apple.com/help/account/api/enterprise-program-api",
+            "snippet": "The Enterprise Program API is a REST API that enables automation of actions on the Apple Developer website.",
+        }
+    ]
+    assert run_prep.select_company_overview_result(results, "Apple", "apple.com") is None
+    dossier = run_prep.extract_company_dossier("Apple", "", [], results, [], customer_name="Liel Oren")
+    assert "Enterprise Program API is a REST API" not in dossier["what_they_do"]
+
+    payload = base_render_payload()
+    payload["customer"] = {
+        "name": "Apple",
+        "contact": "Liel Oren",
+        "domain": "apple.com",
+        "website": "apple.com",
+        "company_name": "Apple",
+        "description": "",
+    }
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "weak", "evidence": ["Weak signal: api"]}
+    payload["enrichment"] = {"available": True, "dossier": {"company": "Apple", "product_modules": ["API / enterprise plans"], "social_content_presence": "paid media / landing-page creative workflow signal found"}}
+    rendered = render_prep_doc.render(payload)
+    assert "Enterprise Program API is a REST API" not in rendered.split("# Meeting Output Template", 1)[0]
+    assert "Core Business | To Validate: core business." in rendered
+    assert "Product Modules | To Validate: identify active workload first; possible product modules depend on confirmed use case." in rendered
+    assert "Voice/audio generation" not in rendered
+    assert "Social / Content / Paid Media Presence | Not Found: no confirmed social or paid-media creative workflow from current sources" in rendered
+    assert "Likely: paid media / landing-page creative workflow" not in rendered
+    assert "Likely: Seedance" not in rendered
+    assert "Likely: Seedream" not in rendered
+    assert "Likely: Ark" not in rendered
+    assert "Question Coverage Matrix" not in rendered
+
+
+def test_company_overview_evidence_table_prioritizes_used_source() -> None:
+    payload = base_render_payload()
+    payload["customer"] = {
+        "name": "Apple",
+        "contact": "Liel Oren",
+        "domain": "apple.com",
+        "website": "apple.com",
+        "company_name": "Apple",
+        "description": "Apple designs products and services.",
+    }
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["enrichment"] = {
+        "available": True,
+        "source_links": [{"url": "https://www.apple.com/"}],
+        "dossier": {
+            "company": "Apple",
+            "what_they_do": "Apple designs products and services.",
+            "source_evidence": [
+                {"claim": "Apple homepage overview", "url": "https://www.apple.com/", "tier_label": "Tier 1 - official company site", "source_classification": "customer_evidence"},
+                {"claim": "Enterprise Program API docs", "url": "https://developer.apple.com/documentation/enterpriseprogramapi", "tier_label": "Tier 1 - official company site", "source_classification": "customer_evidence"},
+                {"claim": "Apple competitors and alternatives", "url": "https://example.com/apple-competitors", "tier_label": "Tier 4 - public web/news/review", "source_classification": "generic_market_reference"},
+            ],
+        },
+    }
+    rendered = render_prep_doc.render(payload)
+    evidence = rendered.split("## Evidence Table", 1)[1]
+    assert evidence.index("https://www.apple.com/") < evidence.find("https://developer.apple.com/documentation/enterpriseprogramapi") or "https://developer.apple.com/documentation/enterpriseprogramapi" not in evidence
+    assert "https://example.com/apple-competitors" not in evidence
+    assert "Main AI Use Cases | To Validate: active AI or BytePlus-relevant workload is not confirmed." in rendered
+
+
 def test_prior_docs_attribution_distinguishes_candidate_from_usable() -> None:
     payload = base_render_payload()
     payload["prior_docs"] = [{"title": "BytePlus <> David - Pre-Meeting Prep", "url": "https://doc.example", "summary": "Web search results: https://example.com"}]
@@ -755,11 +1106,11 @@ def test_company_dossier_extracts_fields_from_evidence() -> None:
                 "url": "https://www.imagine.art/",
                 "snippet": "generates images, videos, shorts, and voice from text prompt. BG remover, upscaler, and custom models.",
             },
-            {
-                "title": "Scale",
-                "url": "https://news.example/imagineart",
-                "snippet": "over 3.5 million active users and 3.2 million downloads. ImagineArt is located in San Francisco, California, United States. Who are competitors?",
-            },
+                {
+                    "title": "Scale",
+                    "url": "https://news.example/imagineart",
+                    "snippet": "ImagineArt reports over 3.5 million active users and 3.2 million downloads. ImagineArt is located in San Francisco, California, United States.",
+                },
         ],
         [],
     )
