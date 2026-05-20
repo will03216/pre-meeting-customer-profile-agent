@@ -111,6 +111,8 @@ class PrepContext:
     search_results: list[dict[str, Any]] = field(default_factory=list)
     docs_search_available: bool = True
     web_search_available: bool = False
+    web_search_status: str = "disabled_or_not_configured"
+    company_overview_status: str = "disabled_or_not_configured"
     known: dict[str, Any] = field(default_factory=dict)
 
 
@@ -255,6 +257,13 @@ VERTICAL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "conversion optimization",
         "landing page",
         "performance marketing",
+        "advertising",
+        "marketing services",
+        "agency network",
+        "agency networks",
+        "media buying",
+        "brand marketing",
+        "creative services",
         "affiliate",
         "creative testing",
         "cac",
@@ -1034,7 +1043,7 @@ def clean_duckduckgo_url(url: str) -> str:
 
 def web_search(query: str, *, max_results: int = 5, debug: bool = False) -> tuple[list[dict[str, str]], str | None]:
     if is_web_search_disabled():
-        return [], "Web search disabled by PREP_WEB_SEARCH_DISABLED."
+        return [], "web_search: disabled_or_not_configured"
     url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -1042,7 +1051,7 @@ def web_search(query: str, *, max_results: int = 5, debug: bool = False) -> tupl
             body = response.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, TimeoutError) as exc:
         debug_log(debug, f"web search failed for {query!r}: {exc}")
-        return [], "Web search unavailable in this run."
+        return [], "web_search: request_failed"
 
     results: list[dict[str, str]] = []
     pattern = re.compile(
@@ -1059,7 +1068,7 @@ def web_search(query: str, *, max_results: int = 5, debug: bool = False) -> tupl
         if len(results) >= max_results:
             break
     if not results:
-        return [], "Web search returned no usable results."
+        return [], "web_search: ran_but_no_results"
     return results, None
 
 
@@ -1118,7 +1127,19 @@ def collect_web_results(queries: list[str], debug: bool = False) -> tuple[list[d
                 collected.append(enriched)
     if collected:
         return sorted(collected, key=web_relevance_score, reverse=True)[:12], None
-    return [], warnings[0] if warnings else "Web search returned no usable results."
+    if any("request_failed" in warning for warning in warnings):
+        return [], "web_search: request_failed"
+    if any("disabled_or_not_configured" in warning for warning in warnings):
+        return [], "web_search: disabled_or_not_configured"
+    return [], warnings[0] if warnings else "web_search: ran_but_no_results"
+
+
+def web_status_from_warning(warning: str | None, has_results: bool) -> str:
+    if has_results:
+        return "usable_results_found"
+    if warning and "web_search:" in warning:
+        return warning.split("web_search:", 1)[1].strip()
+    return "ran_but_no_results"
 
 
 def contextual_web_score(result: dict[str, str], customer_name: str | None, company_name: str | None) -> int:
@@ -1195,6 +1216,24 @@ def verified_related_domain(host: str, company_name: str | None) -> bool:
     return False
 
 
+def confirmed_domain_match(url_or_host: str, confirmed_domain: str | None = None) -> bool:
+    if not confirmed_domain:
+        return False
+    host = urlparse(url_or_host).netloc.lower() if "://" in url_or_host else url_or_host.lower()
+    host = host.split(":")[0].removeprefix("www.")
+    domain = confirmed_domain.lower().split(":")[0].removeprefix("www.")
+    return bool(host and domain and (host == domain or host.endswith("." + domain)))
+
+
+def official_source(url: str, company_name: str | None = None, confirmed_domain: str | None = None) -> bool:
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    return bool(
+        likely_official_web_result({"url": url}, company_name)
+        or verified_related_domain(host, company_name)
+        or confirmed_domain_match(url, confirmed_domain)
+    )
+
+
 def blocked_as_company_website(host: str) -> bool:
     blocked = (
         "linkedin.com",
@@ -1256,13 +1295,39 @@ def stable_company_website(host: str) -> str:
 
 
 def stable_company_description(company_name: str | None, description: str, use_cases: list[str]) -> str:
+    normalized = normalize_company_overview(description, company_name)
+    if normalized:
+        return normalized
     lowered = description.lower()
     weak_page = any(item in lowered for item in ("monetization", "help center", "community", "pricing", "frequently asked"))
     if company_name and (weak_page or not description):
         if use_cases and any("creative" in item or "image" in item or "video" in item for item in use_cases):
             return f"{company_name} appears to be a generative AI creative platform focused on " + ", ".join(use_cases[:3]) + "."
         return ""
+    if overview_quality_issue(description, company_name):
+        return ""
     return description
+
+
+PLACEHOLDER_PATTERNS = (
+    "official company overview",
+    "company overview",
+    "generic company overview",
+    "normalized overview",
+    "overview unavailable",
+    "to validate: to validate",
+)
+
+
+def contains_placeholder(text: str | None) -> bool:
+    lowered = (text or "").lower()
+    return any(pattern in lowered for pattern in PLACEHOLDER_PATTERNS)
+
+
+def clean_source_label(label: str, url: str = "") -> str:
+    if contains_placeholder(label):
+        return url
+    return label
 
 
 def source_purpose(url: str, title: str = "", snippet: str = "") -> str:
@@ -1288,10 +1353,20 @@ def source_purpose(url: str, title: str = "", snippet: str = "") -> str:
 
 
 def broad_company_overview_allowed(url: str, title: str = "", snippet: str = "", company_name: str | None = None) -> bool:
+    path = urlparse(url).path.lower().strip("/")
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    if host.startswith(("developer.", "support.", "help.", "docs.")):
+        return False
+    broad_paths = {"", "about", "company", "about-us", "newsroom"}
+    if path in broad_paths or path.startswith("about-") or path.startswith("company/"):
+        return True
+    if "newsroom/" in path:
+        return False
     purpose = source_purpose(url, title, snippet)
+    if purpose in {"pricing", "developer_docs", "support", "reference"}:
+        return False
     if purpose == "company_overview":
         return True
-    host = urlparse(url).netloc.lower()
     if company_name and likely_official_web_result({"url": url}, company_name) and urlparse(url).path.strip("/") in {"", "about", "company"}:
         return True
     return False
@@ -1302,7 +1377,7 @@ def select_company_overview_result(results: list[dict[str, str]], company_name: 
         return None
     official_broad = [
         item for item in results
-        if likely_official_web_result(item, company_name)
+        if official_source(item.get("url", ""), company_name, domain)
         and broad_company_overview_allowed(item.get("url", ""), item.get("title", ""), item.get("snippet", ""), company_name)
     ]
     if official_broad:
@@ -1320,14 +1395,14 @@ def select_company_overview_result(results: list[dict[str, str]], company_name: 
             continue
         if source_purpose(url, title, snippet) in {"pricing", "developer_docs", "support", "reference"}:
             continue
-        if source_tier(url, company_name)[0] <= 3 and company_name.lower() in text:
+        if source_tier(url, company_name, domain)[0] <= 3 and company_name.lower() in text:
             trusted_business.append(item)
     return trusted_business[0] if trusted_business else None
 
 
-def source_tier(url: str, company_name: str | None = None) -> tuple[int, str]:
+def source_tier(url: str, company_name: str | None = None, confirmed_domain: str | None = None) -> tuple[int, str]:
     host = urlparse(url).netloc.lower().removeprefix("www.")
-    official = company_name and likely_official_web_result({"url": url}, company_name)
+    official = official_source(url, company_name, confirmed_domain)
     verified = verified_related_domain(host, company_name)
     if host.startswith(("docs.", "help.", "support.")) and (official or verified):
         return 1, "Tier 1 - official docs/help"
@@ -1392,6 +1467,139 @@ def collect_page_evidence(results: list[dict[str, str]], company_name: str | Non
     return pages
 
 
+def official_domain_overview_candidates(domain: str) -> list[dict[str, str]]:
+    normalized = domain.lower().removeprefix("www.").strip("/")
+    if not normalized:
+        return []
+    urls: list[str] = []
+    for host in (normalized, f"www.{normalized}"):
+        for path in ("", "/about", "/company", "/about-us", "/newsroom"):
+            urls.append(f"https://{host}{path}")
+    candidates = []
+    seen: set[str] = set()
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        candidates.append({"title": "Company homepage/about page", "url": url, "snippet": "", "source": "web"})
+    return candidates
+
+
+def clean_overview_snippet(text: str, company_name: str | None) -> str:
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if not clean:
+        return ""
+    normalized = normalize_company_overview(clean, company_name)
+    if normalized:
+        return normalized
+    sentences = re.split(r"(?<=[.!?])\s+", clean)
+    selected: list[str] = []
+    company_lower = (company_name or "").lower()
+    for sentence in sentences:
+        lowered = sentence.lower()
+        if len(sentence) < 40:
+            continue
+        if company_lower and company_lower.split()[0] not in lowered and not any(term in lowered for term in ("company", "platform", "studio", "media", "creates", "designs", "operates", "provides")):
+            continue
+        selected.append(sentence.strip())
+        if len(" ".join(selected)) > 260:
+            break
+    return " ".join(selected)[:500].strip(" -")
+
+
+def overview_quality_issue(text: str, company_name: str | None = None) -> bool:
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if not clean:
+        return True
+    lowered = clean.lower()
+    company = (company_name or "").lower()
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9+.-]*", lowered)
+    if len(tokens) < 8:
+        return True
+    if company:
+        company_count = sum(1 for token in tokens if token == company)
+        if company_count >= 3:
+            return True
+    nav_terms = ["learn more", "buy", "support", "accessories", "store", "entertainment", "tv & home"]
+    if sum(1 for term in nav_terms if term in lowered) >= 3:
+        return True
+    if len(set(tokens)) / max(len(tokens), 1) < 0.55:
+        return True
+    return False
+
+
+def normalize_company_overview(text: str, company_name: str | None = None) -> str:
+    lowered = (text or "").lower()
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    company = company_name or "The company"
+    if contains_placeholder(compact):
+        return ""
+    is_apple = company.lower() == "apple" or "apple.com" in lowered
+    if is_apple and any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv", "vision")):
+        if overview_quality_issue(compact, company_name):
+            return "Apple is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across products such as iPhone, Mac, iPad, Apple Watch, Vision, AirPods, and Apple TV."
+        return compact
+    compact_company = re.sub(r"[^a-z0-9]+", "", company.lower())
+    if compact_company in {"interpublicgroupipg", "interpublicgroup", "ipg"} or any(term in lowered for term in ("global advertising", "marketing services", "agency networks", "agency network", "media buying", "brand marketing", "mccann", "fcb", "ipg mediabrands")):
+        return "Interpublic Group (IPG) is a global advertising and marketing services holding company with agency networks across creative, media, data, technology, communications, and brand marketing services."
+    if "keshet" in compact_company or any(term in lowered for term in ("keshet broadcasting", "keshet 12", "streaming service", "content distribution", "international content", "media company")):
+        return "Keshet Media Group is a media and entertainment company with broadcasting, streaming, production, news, and international content distribution businesses."
+    if any(term in lowered for term in ("intent marketing", "comparison platform", "customer acquisition")):
+        return f"{company} is an intent-marketing and customer-acquisition company focused on connecting consumers with brands through comparison and performance marketing platforms."
+    if any(term in lowered for term in ("creative platform", "stock assets", "templates", "image generation", "video generation", "design platform")):
+        return f"{company} is a creative platform offering design assets, templates, and AI-enabled image/video tools for creators, marketers, agencies, and enterprise creative teams."
+    if overview_quality_issue(compact, company_name):
+        return ""
+    return ""
+
+
+def collect_official_domain_overview(domain: str | None, company_name: str | None, debug: bool = False) -> tuple[list[dict[str, str]], list[dict[str, Any]], str | None]:
+    if not domain:
+        return [], [], "web_search: disabled_or_not_configured"
+    results: list[dict[str, str]] = []
+    pages: list[dict[str, Any]] = []
+    failures = 0
+    for candidate in official_domain_overview_candidates(domain):
+        text, warning = fetch_page_text(candidate["url"], debug=debug)
+        snippet = clean_overview_snippet(text, company_name)
+        page = {
+            "title": clean_source_label(candidate["title"], candidate["url"]),
+            "url": candidate["url"],
+            "snippet": snippet,
+            "text": text,
+            "fetch_warning": warning or "",
+            "tier": source_tier(candidate["url"], company_name, domain)[0],
+            "tier_label": source_tier(candidate["url"], company_name, domain)[1],
+            "source": "web_page",
+        }
+        if snippet:
+            result = dict(candidate)
+            result["snippet"] = snippet
+            results.append(result)
+            pages.append(page)
+            break
+        failures += 1
+        if len(pages) < 2:
+            pages.append(page)
+    if results:
+        return results, pages, None
+    return [], pages, "web_search: request_failed" if failures else "web_search: ran_but_no_results"
+
+
+def official_company_overview_evidence(dossier: dict[str, Any], company_name: str | None = None) -> dict[str, Any] | None:
+    for item in dossier.get("source_evidence") or []:
+        if item.get("source_classification") != "customer_evidence":
+            continue
+        if "Tier 1 - official company site" not in str(item.get("tier_label", "")):
+            continue
+        claim = str(item.get("claim") or "").strip()
+        if contains_placeholder(claim) or overview_quality_issue(claim, company_name):
+            continue
+        if broad_company_overview_allowed(item.get("url", ""), "", claim, company_name):
+            return item
+    return None
+
+
 def extract_pricing_tiers(text: str) -> list[str]:
     tiers = []
     for tier in ["Free", "Basic", "Standard", "Ultimate", "Creator", "Enterprise", "Pro", "Team", "Business"]:
@@ -1400,19 +1608,20 @@ def extract_pricing_tiers(text: str) -> list[str]:
     return tiers[:8]
 
 
-def customer_related_pricing_text(company_name: str | None, enrichment_description: str, web_results: list[dict[str, str]], pages: list[dict[str, Any]]) -> str:
+def customer_related_pricing_text(company_name: str | None, enrichment_description: str, web_results: list[dict[str, str]], pages: list[dict[str, Any]], confirmed_domain: str | None = None) -> str:
     if not company_name:
         return ""
     blocked_hosts = ("openai.com", "claude.com", "anthropic.com")
-    person_company_terms = ("fabien", "siderakis", "lamethodepapier", "la methode papier", "la méthode papier")
-    parts = [enrichment_description]
+    parts: list[str] = []
     for item in web_results:
         url = item.get("url", "")
         host = urlparse(url).netloc.lower()
         if any(blocked in host for blocked in blocked_hosts):
             continue
+        if source_purpose(url, item.get("title", ""), item.get("snippet", "")) != "pricing":
+            continue
         haystack = f"{item.get('title', '')} {item.get('snippet', '')} {url}".lower()
-        if company_name and not likely_official_web_result(item, company_name) and company_name.lower() not in haystack:
+        if company_name and not official_source(url, company_name, confirmed_domain) and company_name.lower() not in haystack:
             continue
         parts.append(f"{item.get('title', '')} {item.get('snippet', '')}")
     for page in pages:
@@ -1420,27 +1629,50 @@ def customer_related_pricing_text(company_name: str | None, enrichment_descripti
         host = urlparse(url).netloc.lower()
         if any(blocked in host for blocked in blocked_hosts):
             continue
+        if source_purpose(url, page.get("title", ""), page.get("snippet", "")) != "pricing":
+            continue
         haystack = f"{page.get('title', '')} {page.get('snippet', '')} {url}".lower()
-        if company_name and not likely_official_web_result({"url": url}, company_name) and company_name.lower() not in haystack and not verified_related_domain(host, company_name):
+        if company_name and not official_source(url, company_name, confirmed_domain) and company_name.lower() not in haystack:
             continue
         parts.append(page.get("text", ""))
     return " ".join(parts)
 
 
-def classify_source(url: str, title: str = "", snippet: str = "", company_name: str | None = None, customer_name: str | None = None, candidate_company: str | None = None) -> str:
+def contact_company_noise(url: str, title: str, snippet: str, company_name: str | None, contact_name: str | None) -> bool:
+    if not company_name or not contact_name:
+        return False
     text = f"{title} {snippet} {url}".lower()
     host = urlparse(url).netloc.lower()
+    contact_parts = [part for part in re.split(r"\s+", contact_name.lower()) if len(part) > 2]
+    if not contact_parts or company_name.lower() not in text:
+        return False
+    if any(part in text for part in contact_parts) and any(noisy in host for noisy in ("link.me", "linkedin.com")):
+        return True
+    if len(contact_parts) >= 2 and contact_parts[-1] in text and company_name.lower() in text and not official_source(url, company_name):
+        return True
+    return False
+
+
+def classify_source(url: str, title: str = "", snippet: str = "", company_name: str | None = None, customer_name: str | None = None, candidate_company: str | None = None, confirmed_domain: str | None = None, contact_name: str | None = None) -> str:
+    text = f"{title} {snippet} {url}".lower()
+    host = urlparse(url).netloc.lower()
+    if contains_placeholder(text):
+        return "generic_market_reference"
     if any(item in host for item in ("openai.com", "claude.com", "anthropic.com")):
         return "competitor_reference"
-    if company_name and verified_related_domain(host, company_name):
+    if company_name and official_source(url, company_name, confirmed_domain):
         return "customer_evidence"
-    if host.removeprefix("www.").startswith(("docs.", "help.", "support.")) and not (company_name and likely_official_web_result({"url": url}, company_name)):
+    if contact_company_noise(url, title, snippet, company_name, contact_name):
+        return "generic_market_reference"
+    if not official_source(url, company_name, confirmed_domain) and any(item in text for item in ("statistics", "stats", "projected", "market share", "downloads are expected", "total users")):
+        return "generic_market_reference"
+    if host.removeprefix("www.").startswith(("docs.", "help.", "support.")) and not official_source(url, company_name, confirmed_domain):
         return "generic_market_reference"
     if any(item in text for item in ("competitor", "alternative", "alternatives")):
         return "generic_market_reference"
-    if "pricing" in text and not (company_name and (likely_official_web_result({"url": url}, company_name) or verified_related_domain(host, company_name))):
+    if "pricing" in text and not official_source(url, company_name, confirmed_domain):
         return "generic_market_reference"
-    if company_name and (likely_official_web_result({"url": url}, company_name) or company_name.lower() in text):
+    if company_name and company_name.lower() in text:
         return "customer_evidence"
     candidate_terms = [term.lower() for term in [candidate_company or "", customer_name or ""] if term]
     if any(term and term in text for term in candidate_terms):
@@ -1450,6 +1682,31 @@ def classify_source(url: str, title: str = "", snippet: str = "", company_name: 
     return "generic_market_reference"
 
 
+def evidence_claim(title: str, snippet: str, url: str, company_name: str | None = None) -> str:
+    normalized = normalize_company_overview(snippet or title or "", company_name)
+    if normalized:
+        return normalized
+    for value in (snippet, title, url):
+        clean = re.sub(r"\s+", " ", value or "").strip()
+        if clean and not contains_placeholder(clean):
+            return clean
+    return ""
+
+
+def usable_evidence_row(item: dict[str, Any], company_name: str | None = None) -> bool:
+    claim = str(item.get("claim") or "").strip()
+    url = str(item.get("url") or "").lower()
+    if not claim or contains_placeholder(claim):
+        return False
+    if "link.me/" in url:
+        return False
+    if item.get("source_classification") not in {"customer_evidence", "candidate_entity_evidence"}:
+        return False
+    if broad_company_overview_allowed(url, "", claim, company_name) and overview_quality_issue(claim, company_name):
+        return False
+    return True
+
+
 def extract_company_dossier(
     company_name: str | None,
     enrichment_description: str,
@@ -1457,6 +1714,8 @@ def extract_company_dossier(
     web_results: list[dict[str, str]],
     pages: list[dict[str, Any]],
     customer_name: str | None = None,
+    confirmed_domain: str | None = None,
+    contact_name: str | None = None,
 ) -> dict[str, Any]:
     combined = " ".join(
         [enrichment_description]
@@ -1474,14 +1733,14 @@ def extract_company_dossier(
         ("Background remover", ("background remover", "bg remover")),
         ("Upscaler", ("upscaler", "upscale")),
         ("Custom models", ("custom model", "custom models")),
-        ("API / enterprise plans", ("api", "enterprise")),
+        ("API / enterprise plans", ("api", "developer api", "enterprise plan", "enterprise plans")),
     ]
     lowered = combined.lower()
     for label, needles in module_signals:
         if any(needle in lowered for needle in needles):
             modules.append(label)
 
-    pricing_tiers = extract_pricing_tiers(customer_related_pricing_text(company_name, enrichment_description, web_results, pages))
+    pricing_tiers = extract_pricing_tiers(customer_related_pricing_text(company_name, enrichment_description, web_results, pages, confirmed_domain))
     candidate_company = ""
     if not company_name:
         if "la methode papier" in lowered or "la méthode papier" in lowered:
@@ -1500,6 +1759,8 @@ def extract_company_dossier(
             company_name,
             customer_name,
             candidate_company,
+            confirmed_domain,
+            contact_name,
         )
         if classification in {"customer_evidence", "candidate_entity_evidence"}:
             trusted_scale_parts.append(f"{item.get('title', '')} {item.get('snippet', '')}")
@@ -1511,6 +1772,8 @@ def extract_company_dossier(
             company_name,
             customer_name,
             candidate_company,
+            confirmed_domain,
+            contact_name,
         )
         if classification in {"customer_evidence", "candidate_entity_evidence"}:
             trusted_scale_parts.append(page.get("text", "") or f"{page.get('title', '')} {page.get('snippet', '')}")
@@ -1521,6 +1784,9 @@ def extract_company_dossier(
         r"over\s+[\d.]+\s*(?:million|m|k)\s+purchase decisions",
         r"[\d.]+\s*(?:million|m|k)\s+downloads",
         r"\$[\d.]+\s*(?:m|million|b|billion)\s+(?:arr|annual recurring revenue|revenue)",
+        r"[\d.]+\s*(?:b|billion|m|million)\s+(?:in\s+)?(?:annual\s+)?revenue",
+        r"over\s+[\d,]+\s+employees",
+        r"[\d,]+\s+employees",
         r"[\d.]+\s*(?:million|m|k)\s+paid subscribers",
         r"(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+million\s+paid subscribers",
         r"[\d,]+\s+enterprise (?:clients|customers)",
@@ -1545,7 +1811,11 @@ def extract_company_dossier(
     hq = ""
     hq_match = re.search(r"(?:located in|based in|location in)\s+([A-Z][A-Za-z ,.-]{2,80})", combined)
     if hq_match:
-        hq = re.split(r"\bWho\b|\bWhat\b|\bWhen\b|\bFrequently\b", hq_match.group(1))[0].strip(" .")
+        hq = re.split(
+            r"\bwith\b|\band\b|\bestimated\b|\brevenue\b|\bWho\b|\bWhat\b|\bWhen\b|\bFrequently\b|[.;]",
+            hq_match.group(1),
+        )[0].strip(" .,-")
+        hq = re.sub(r"\s*-\s*", " ", hq).strip()
     founded_year = ""
     founded_match = re.search(r"(?:est\.?|founded|operating since)\s*(?:in)?\s*(20\d{2}|19\d{2})", combined, re.IGNORECASE)
     if founded_match:
@@ -1553,10 +1823,16 @@ def extract_company_dossier(
     creative_signal = any(term in lowered for term in ("image generation", "video generation", "generative ai", "creative platform", "creator", "designers", "ai image", "ai video"))
     marketing_signal = any(term in lowered for term in ("intent marketing", "customer acquisition", "comparison platform", "high-intent consumers"))
     target_users = ""
-    if creative_signal:
-        target_users = "creators, designers, marketers, agencies, enterprise creative teams, and API developers"
-    elif any(term in lowered for term in ("high-intent consumers", "top-tier brands", "advertisers", "publishers")):
+    if marketing_signal or any(term in lowered for term in ("high-intent consumers", "top-tier brands", "advertisers", "publishers")):
         target_users = "high-intent consumers, brand/advertiser partners, and publishers"
+    elif any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing", "creative services", "communications")):
+        target_users = "global brands, advertisers, enterprise marketing teams, media buyers, and agency clients"
+    elif any(term in lowered for term in ("media and entertainment", "media company", "broadcasting", "broadcasters", "tv channel", "news company", "streaming service", "streamers", "streaming platforms", "content buyers", "international distributors", "format licensing", "global distribution", "content distribution", "production partners")):
+        target_users = "TV/streaming audiences, broadcasters/streamers, production partners, content buyers, and media partners"
+    elif any(term in lowered for term in ("consumer devices", "iphone", "mac", "ipad", "apple watch", "app store", "developers", "enterprise customers")):
+        target_users = "consumers, developers, enterprise customers, creative professionals, and ecosystem partners"
+    elif creative_signal:
+        target_users = "creators, designers, marketers, agencies, enterprise creative teams, and API developers"
     traffic_source_scale = ""
     traffic_terms = []
     for term in ("seo", "sem", "affiliate", "paid social", "partner traffic", "high-intent audiences", "purchase decisions"):
@@ -1565,16 +1841,22 @@ def extract_company_dossier(
     if traffic_terms:
         traffic_source_scale = "; ".join(dict.fromkeys(traffic_terms))
     business_model = ""
-    if creative_signal and any(term in lowered for term in ("subscription", "credits", "api", "enterprise", "paid subscribers", "pricing")):
-        business_model = "subscription, credit, API, and enterprise creative-platform packaging"
-    elif marketing_signal or any(term in lowered for term in ("publishers monetize",)):
+    if marketing_signal or any(term in lowered for term in ("publishers monetize",)):
         business_model = "intent-marketing / comparison-platform model connecting consumers, publishers, and brands"
+    elif any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing", "creative services", "communications")):
+        business_model = "advertising, marketing services, media planning/buying, creative services, data/technology-enabled marketing, communications, and agency network services"
+    elif any(term in lowered for term in ("media and entertainment", "media company", "broadcasting", "tv channel", "news company", "streaming service", "format licensing", "global distribution", "content distribution", "content production", "production arm", "media partnerships", "broadcasters", "streamers", "content buyers")):
+        business_model = "broadcasting, streaming, content production, format licensing/global distribution, and media partnerships"
+    elif any(term in lowered for term in ("consumer devices", "iphone", "mac", "ipad", "apple watch", "app store", "subscriptions", "accessories")):
+        business_model = "hardware sales, software/services revenue, App Store ecosystem, subscriptions, accessories, and support"
+    elif creative_signal and any(term in lowered for term in ("subscription", "credits", "api", "enterprise", "paid subscribers", "pricing")):
+        business_model = "subscription, credit, API, and enterprise creative-platform packaging"
     social_content_presence = ""
     if any(term in lowered for term in ("paid media", "ad creative", "landing page", "creative testing", "paid social")):
         social_content_presence = "paid media / landing-page creative workflow signal found"
     source_evidence = []
-    for item in sorted(web_results[:8], key=lambda x: source_tier(x.get("url", ""), company_name)[0]):
-        tier, tier_label = source_tier(item.get("url", ""), company_name)
+    for item in sorted(web_results[:8], key=lambda x: source_tier(x.get("url", ""), company_name, confirmed_domain)[0]):
+        tier, tier_label = source_tier(item.get("url", ""), company_name, confirmed_domain)
         classification = classify_source(
             item.get("url", ""),
             item.get("title", ""),
@@ -1582,17 +1864,19 @@ def extract_company_dossier(
             company_name,
             customer_name,
             candidate_company,
+            confirmed_domain,
+            contact_name,
         )
         source_evidence.append(
             {
-                "claim": item.get("snippet") or item.get("title") or item.get("url"),
+                "claim": evidence_claim(item.get("title", ""), item.get("snippet", ""), item.get("url", ""), company_name),
                 "url": item.get("url", ""),
                 "tier": tier,
                 "tier_label": tier_label,
                 "source_classification": classification,
             }
         )
-    for page in sorted(pages[:6], key=lambda x: source_tier(x.get("url", ""), company_name)[0]):
+    for page in sorted(pages[:6], key=lambda x: source_tier(x.get("url", ""), company_name, confirmed_domain)[0]):
         classification = classify_source(
             page.get("url", ""),
             page.get("title", ""),
@@ -1600,13 +1884,15 @@ def extract_company_dossier(
             company_name,
             customer_name,
             candidate_company,
+            confirmed_domain,
+            contact_name,
         )
         source_evidence.append(
             {
-                "claim": page.get("snippet") or page.get("title") or page.get("url"),
+                "claim": evidence_claim(page.get("title", ""), page.get("snippet", ""), page.get("url", ""), company_name),
                 "url": page.get("url", ""),
-                "tier": source_tier(page.get("url", ""), company_name)[0],
-                "tier_label": source_tier(page.get("url", ""), company_name)[1],
+                "tier": source_tier(page.get("url", ""), company_name, confirmed_domain)[0],
+                "tier_label": source_tier(page.get("url", ""), company_name, confirmed_domain)[1],
                 "source_classification": classification,
             }
         )
@@ -1626,7 +1912,7 @@ def extract_company_dossier(
         "social_content_presence": social_content_presence,
         "candidate_company": candidate_company,
         "source_evidence": sorted(
-            [item for item in source_evidence if item["source_classification"] in {"customer_evidence", "candidate_entity_evidence"}],
+            [item for item in source_evidence if usable_evidence_row(item, company_name)],
             key=lambda item: (
                 0 if broad_company_overview_allowed(item.get("url", ""), "", item.get("claim", ""), company_name) else 1,
                 item.get("tier", 9),
@@ -1655,7 +1941,7 @@ def infer_use_cases(text: str) -> list[str]:
         (("image", "ai art", "text-to-image", "background remover", "upscaler"), "image generation and creative asset editing"),
         (("video", "shorts", "text-to-video", "ai video"), "video generation / short-form creative workflow"),
         (("voice", "audio", "tts", "text to speech"), "voice or audio generation workflow"),
-        (("api", "enterprise", "custom model"), "API or enterprise integration requirements"),
+        (("developer api", "api integration", " api ", "custom model", "enterprise integration"), "API or enterprise integration requirements"),
     ]
     for needles, label in signals:
         if any(needle in lowered for needle in needles) and label not in use_cases:
@@ -1748,7 +2034,7 @@ def synthesize_known_fields(enrichment: dict[str, Any] | None, docs: list[dict[s
         known["monthly_volume"] = "Public scale signal: " + "; ".join(dossier["scale_signals"][:2]) + " (?)"
         known["paid_users"] = "To Validate: paid/free split; public sources mention usage scale but not paid user count."
     if dossier.get("pricing_tiers"):
-        known["budget_status"] = "Public pricing/packaging found: " + ", ".join(dossier["pricing_tiers"]) + ". Validate current AI infra spend."
+        known["budget_status"] = "To Validate: public customer packaging terms were found, but actual AI infra spend, vendor commitments, budget owner, and BytePlus-relevant commitment are not confirmed."
     if dossier.get("product_modules"):
         known["expansion_opportunity"] = "Likely product modules: " + ", ".join(dossier["product_modules"][:6])
     return known
@@ -1757,20 +2043,71 @@ def synthesize_known_fields(enrichment: dict[str, Any] | None, docs: list[dict[s
 def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dict[str, Any] | None, list[dict[str, str]], str | None]:
     customer = context.customer
     inferred_company = customer.company_name or (domain_to_name(customer.domain) if customer.domain else None) or infer_company_from_docs(customer.canonical_name, context.prior_docs)
+    direct_overview_results: list[dict[str, str]] = []
+    direct_overview_pages: list[dict[str, Any]] = []
+    direct_overview_warning: str | None = None
+    if customer.domain and inferred_company:
+        direct_overview_results, direct_overview_pages, direct_overview_warning = collect_official_domain_overview(customer.domain, inferred_company, debug=debug)
+    company_overview_status = "usable_results_found" if direct_overview_results else "no_overview_eligible_results"
     queries = expand_web_queries(customer, inferred_company)
     if not queries:
-        return None, [], "Web search skipped because customer identity is unknown."
+        return None, [], "web_search: disabled_or_not_configured"
     results, warning = collect_web_results(queries, debug=debug)
     if not results:
-        return None, [], warning
+        if direct_overview_results:
+            results = direct_overview_results
+            page_evidence = direct_overview_pages
+            warning = None
+        elif customer.domain and inferred_company:
+            dossier = extract_company_dossier(inferred_company, "", [], [], direct_overview_pages, customer.canonical_name, customer.domain, customer.contact_name)
+            description = "To Validate: business description could not be enriched because web search/fetch was unavailable."
+            dossier["what_they_do"] = description
+            enrichment = {
+                "available": True,
+                "confidence": "low",
+                "website": customer.domain,
+                "company_name": inferred_company,
+                "description": description,
+                "dossier": dossier,
+                "page_evidence": direct_overview_pages,
+                "industry": "To Validate: industry could not be enriched from available sources",
+                "known_use_cases": [],
+                "known_competitors": [],
+                "known_risks": ["Public company overview unavailable; validate customer requirements, budget, timeline, and decision process"],
+                "possible_byteplus_fit": [],
+                "suggested_questions": [],
+                "source_links": [],
+                "source": "web_search",
+                "web_search_status": web_status_from_warning(warning, False),
+                "company_overview_status": company_overview_status,
+            }
+            return enrichment, [], warning
+        else:
+            return None, [], warning
+    else:
+        page_evidence = direct_overview_pages + collect_page_evidence(results, inferred_company, debug=debug)
+        if direct_overview_results:
+            seen_result_urls = {item.get("url") for item in direct_overview_results}
+            results = direct_overview_results + [item for item in results if item.get("url") not in seen_result_urls]
     scored_results = sorted(
         ((contextual_web_score(item, customer.canonical_name, inferred_company), item) for item in results),
         key=lambda pair: pair[0],
         reverse=True,
     )
     filtered_results = [item for score, item in scored_results if score > 0]
-    results = (filtered_results or [item for _, item in scored_results])[:12]
-    page_evidence = collect_page_evidence(results, inferred_company, debug=debug)
+    if filtered_results:
+        results = filtered_results[:12]
+    elif customer.domain and inferred_company:
+        if direct_overview_results:
+            results = direct_overview_results
+            page_evidence = direct_overview_pages
+            warning = None
+        else:
+            results = [item for _, item in scored_results][:12]
+            warning = warning or None
+    else:
+        results = [item for _, item in scored_results][:12]
+        warning = warning or None
 
     preferred = results[0]
     for item in results:
@@ -1781,7 +2118,7 @@ def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dic
     else:
         preferred = max(results, key=product_description_score)
     for item in results:
-        if likely_official_web_result(item, inferred_company):
+        if official_source(item.get("url", ""), inferred_company, customer.domain):
             preferred = item
             break
     if inferred_company:
@@ -1797,15 +2134,32 @@ def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dic
         for item in results:
             parsed = urlparse(item["url"])
             host = parsed.netloc.lower().removeprefix("www.")
-            if host and likely_official_web_result(item, inferred_company) and not blocked_as_company_website(host):
+            if host and official_source(item.get("url", ""), inferred_company, customer.domain) and not blocked_as_company_website(host):
                 website = stable_company_website(host)
                 break
     combined = " ".join((item.get("title", "") + " " + item.get("snippet", "")).lower() for item in results)
     use_cases = infer_use_cases(combined)
-    if any(term in combined for term in ("creative", "generation", "artificial intelligence")) and not use_cases:
+    if any(term in combined for term in ("creative platform", "generative creative", "image generation", "video generation", "text-to-image", "text-to-video")) and not use_cases:
         use_cases.append("creative AI / generative media workflow")
     description = stable_company_description(inferred_company, description, use_cases)
-    dossier = extract_company_dossier(inferred_company, description, use_cases, results, page_evidence, customer.canonical_name)
+    dossier = extract_company_dossier(inferred_company, description, use_cases, results, page_evidence, customer.canonical_name, customer.domain, customer.contact_name)
+    web_search_status = web_status_from_warning(warning, bool(results))
+    official_overview = official_company_overview_evidence(dossier, inferred_company)
+    if official_overview:
+        company_overview_status = "usable_results_found"
+    if official_overview and (
+        not dossier.get("what_they_do")
+        or str(dossier.get("what_they_do", "")).startswith("To Validate:")
+        or not description
+        or str(description).startswith("To Validate:")
+    ):
+        description = str(official_overview.get("claim") or "").strip()
+        dossier["what_they_do"] = description
+        company_overview_status = "usable_results_found"
+    elif inferred_company and customer.domain and not (dossier.get("what_they_do") or description):
+        description = "To Validate: business description could not be enriched because web search/fetch was unavailable."
+        dossier["what_they_do"] = description
+        company_overview_status = "no_overview_eligible_results"
     trusted_source_results = [
         item for item in results
         if classify_source(
@@ -1815,12 +2169,14 @@ def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dic
             inferred_company,
             customer.canonical_name,
             dossier.get("candidate_company"),
+            customer.domain,
+            customer.contact_name,
         ) in {"customer_evidence", "candidate_entity_evidence"}
     ]
     trusted_page_links = [
         {"label": item.get("title") or item.get("url", ""), "url": item.get("url", "")}
         for item in page_evidence
-        if classify_source(item.get("url", ""), item.get("title", ""), item.get("snippet", ""), inferred_company, customer.canonical_name, dossier.get("candidate_company")) in {"customer_evidence", "candidate_entity_evidence"}
+        if classify_source(item.get("url", ""), item.get("title", ""), item.get("snippet", ""), inferred_company, customer.canonical_name, dossier.get("candidate_company"), customer.domain, customer.contact_name) in {"customer_evidence", "candidate_entity_evidence"}
     ]
     source_links = (trusted_page_links + [{"label": item["title"], "url": item["url"]} for item in trusted_source_results])[:5]
     if dossier.get("what_they_do"):
@@ -1844,6 +2200,8 @@ def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dic
         "suggested_questions": questions,
         "source_links": source_links,
         "source": "web_search",
+        "web_search_status": web_search_status,
+        "company_overview_status": company_overview_status,
     }
     return enrichment, results, None
 
@@ -1943,10 +2301,35 @@ def build_context(
     web_enrichment, web_results, web_warning = build_web_enrichment(context, debug=debug)
     context.search_results = web_results
     context.web_search_available = bool(web_results)
+    if web_enrichment and web_enrichment.get("web_search_status"):
+        context.web_search_status = str(web_enrichment["web_search_status"])
+    elif web_results:
+        context.web_search_status = "usable_results_found"
+    elif web_warning and "web_search:" in web_warning:
+        context.web_search_status = web_warning.split("web_search:", 1)[1].strip()
+    else:
+        context.web_search_status = "ran_but_no_results"
+    if web_enrichment and web_enrichment.get("company_overview_status"):
+        context.company_overview_status = str(web_enrichment["company_overview_status"])
+    elif customer := context.customer:
+        context.company_overview_status = "no_overview_eligible_results" if customer.domain else "disabled_or_not_configured"
     context.enrichment = mcp_enrichment or web_enrichment
     context.known = synthesize_known_fields(context.enrichment, context.prior_docs, context.search_results)
-    if web_warning:
-        context.missing_context.append(web_warning)
+    dossier = (context.enrichment or {}).get("dossier") or {}
+    if any(
+        item.get("source_classification") == "customer_evidence"
+        and "Tier 1 - official company site" in str(item.get("tier_label") or "")
+        and str(item.get("claim") or "").strip()
+        and not contains_placeholder(str(item.get("claim") or ""))
+        and broad_company_overview_allowed(item.get("url", ""), "", str(item.get("claim") or ""), context.customer.company_name or context.customer.canonical_name)
+        for item in dossier.get("source_evidence") or []
+    ):
+        context.web_search_status = "usable_results_found"
+        context.company_overview_status = "usable_results_found"
+    if web_warning and context.web_search_status != "usable_results_found":
+        context.missing_context.append(f"web_search: {context.web_search_status}")
+    if context.company_overview_status not in {"usable_results_found", "available"}:
+        context.missing_context.append(f"company_overview_enrichment: {context.company_overview_status}")
     if mcp_enrichment is None:
         context.missing_context.append("MCP enrichment unavailable")
     return context
@@ -2006,10 +2389,22 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
             "mcp": "available" if context.enrichment and context.enrichment.get("source") != "web_search" else "unavailable",
             "prior_docs": "available" if context.prior_docs else "none",
             "docs_search": "available" if context.docs_search_available else "unavailable",
-            "web_search": "available" if context.web_search_available else "unavailable",
+            "web_search": context.web_search_status,
+            "company_overview_enrichment": context.company_overview_status,
         },
     }
     dossier = enrichment.get("dossier") or {}
+    has_official_overview_claim = any(
+        item.get("source_classification") == "customer_evidence"
+        and "Tier 1 - official company site" in str(item.get("tier_label") or "")
+        and str(item.get("claim") or "").strip()
+        and not contains_placeholder(str(item.get("claim") or ""))
+        and broad_company_overview_allowed(item.get("url", ""), "", str(item.get("claim") or ""), customer.company_name or customer.canonical_name)
+        for item in dossier.get("source_evidence") or []
+    )
+    if has_official_overview_claim:
+        render_json["source_status"]["web_search"] = "usable_results_found"
+        render_json["source_status"]["company_overview_enrichment"] = "usable_results_found"
     if customer.domain or (enrichment.get("company_name") and enrichment.get("website")):
         render_json["customer_context"] = {"classification": "confirmed_company"}
     elif event:

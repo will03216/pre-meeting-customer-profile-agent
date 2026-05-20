@@ -412,6 +412,26 @@ def test_official_web_result_chosen_over_directory_site() -> None:
     assert run_prep.source_tier("https://docs.imagine.art/community/monetization", "ImagineArt")[1] == "Tier 1 - official docs/help"
     assert run_prep.source_tier("https://docs.fpk2.azadseo.pro/pricing", "Freepik")[1] != "Tier 1 - official docs/help"
     assert run_prep.classify_source("https://docs.fpk2.azadseo.pro/pricing", "Freepik pricing", "Freepik plans", "Freepik") != "customer_evidence"
+    assert run_prep.source_tier("https://www.keshetinternational.com/", "Keshet Media Group", "keshetinternational.com")[1] == "Tier 1 - official company site"
+    assert run_prep.classify_source(
+        "https://www.keshetinternational.com/",
+        "Keshet International",
+        "Keshet International is Keshet Media Group's global distribution and production arm.",
+        "Keshet Media Group",
+        confirmed_domain="keshetinternational.com",
+    ) == "customer_evidence"
+    assert not run_prep.broad_company_overview_allowed(
+        "https://support.apple.com/",
+        "Official Apple Support",
+        "Get help for your Apple devices, services, and subscriptions.",
+        "Apple",
+    )
+    assert not run_prep.broad_company_overview_allowed(
+        "https://www.apple.com/newsroom/2025/06/global-app-store-helps-developers-reach-new-heights/",
+        "Global App Store helps developers reach new heights",
+        "Tim Cook said developers reach Apple users around the world.",
+        "Apple",
+    )
 
 
 def test_web_query_expansion_keeps_customer_specific_queries_scoped() -> None:
@@ -1011,6 +1031,173 @@ def test_contact_company_domain_input_preserves_contact_and_confirms_company() -
     assert "Company / Brand | Liel Oren" not in rendered
     assert "**Likely Customer / Company:** Liel Oren at Apple" in rendered
     assert "Apple at Apple" not in rendered
+    assert "To Validate: To Validate" not in rendered
+
+
+def test_confirmed_company_unavailable_enrichment_has_clear_overview_message() -> None:
+    for company, contact, domain in [
+        ("Apple", "Liel Oren", "apple.com"),
+        ("Keshet Media Group", "Tal Geifman", "keshetinternational.com"),
+    ]:
+        payload = base_render_payload()
+        payload["customer"] = {
+            "name": company,
+            "contact": contact,
+            "company_name": company,
+            "domain": domain,
+            "website": domain,
+            "description": "",
+        }
+        payload["customer_context"] = {"classification": "confirmed_company"}
+        payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+        payload["enrichment"] = {"available": True, "dossier": {"company": company}}
+        payload["source_status"] = {**payload["source_status"], "web_search": "request_failed"}
+        rendered = render_prep_doc.render(payload)
+        assert "To Validate: To Validate" not in rendered
+        assert "What They Do | To Validate: business description could not be enriched because web search/fetch was unavailable." in rendered
+        assert "Contact / Stakeholder" in rendered
+        assert "Product Modules | To Validate: identify active workload first; possible product modules depend on confirmed use case." in rendered
+        assert "- web_search: request_failed" in rendered
+        assert "Question Coverage Matrix" not in rendered
+
+
+def test_web_search_status_diagnostics_are_precise(monkeypatch) -> None:
+    monkeypatch.setattr(run_prep, "search_docs", lambda *args, **kwargs: ([], None))
+    monkeypatch.setattr(run_prep, "call_mcp_enrichment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_prep, "collect_official_domain_overview", lambda *args, **kwargs: ([], [], "web_search: request_failed"))
+    monkeypatch.setattr(run_prep, "web_search", lambda *args, **kwargs: ([], "web_search: request_failed"))
+    context = run_prep.build_context(
+        run_prep.PrepInput(mode="customer", value=None, window=None, contact="Liel Oren", company="Apple", domain="apple.com"),
+        event=None,
+    )
+    assert context.web_search_status == "request_failed"
+    rendered = render_prep_doc.render(run_prep.context_to_renderer_json(context))
+    assert "- web_search: request_failed" in rendered
+
+
+def test_narrow_only_confirmed_company_results_split_search_and_overview_status(monkeypatch) -> None:
+    monkeypatch.setattr(run_prep, "search_docs", lambda *args, **kwargs: ([], None))
+    monkeypatch.setattr(run_prep, "call_mcp_enrichment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_prep, "collect_official_domain_overview", lambda *args, **kwargs: ([], [], "web_search: request_failed"))
+    monkeypatch.setattr(
+        run_prep,
+        "web_search",
+        lambda *args, **kwargs: (
+            [
+                {
+                    "title": "Enterprise Program API",
+                    "url": "https://developer.apple.com/help/account/api/enterprise-program-api",
+                    "snippet": "The Enterprise Program API is a REST API.",
+                    "source": "web",
+                }
+            ],
+            None,
+        ),
+    )
+    context = run_prep.build_context(
+        run_prep.PrepInput(mode="customer", value=None, window=None, contact="Liel Oren", company="Apple", domain="apple.com"),
+        event=None,
+    )
+    assert context.web_search_status == "usable_results_found"
+    assert context.company_overview_status == "no_overview_eligible_results"
+    rendered = render_prep_doc.render(run_prep.context_to_renderer_json(context))
+    assert "To Validate: To Validate" not in rendered
+    assert "- web_search: usable_results_found" in rendered
+    assert "- company_overview_enrichment: no_overview_eligible_results" in rendered
+
+
+def test_confirmed_domain_direct_homepage_fetch_populates_apple_overview(monkeypatch) -> None:
+    monkeypatch.setattr(run_prep, "search_docs", lambda *args, **kwargs: ([], None))
+    monkeypatch.setattr(run_prep, "call_mcp_enrichment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        run_prep,
+        "web_search",
+        lambda *args, **kwargs: (
+            [
+                {
+                    "title": "Enterprise Program API",
+                    "url": "https://developer.apple.com/help/account/api/enterprise-program-api",
+                    "snippet": "The Enterprise Program API is a REST API.",
+                    "source": "web",
+                }
+            ],
+            None,
+        ),
+    )
+
+    def fake_fetch(url: str, debug: bool = False):
+        if url == "https://apple.com":
+            return "Apple designs products including iPhone, iPad, Mac, Apple Watch, services, and software for customers around the world.", None
+        return "", "page fetch failed"
+
+    monkeypatch.setattr(run_prep, "fetch_page_text", fake_fetch)
+    context = run_prep.build_context(
+        run_prep.PrepInput(mode="customer", value=None, window=None, contact="Liel Oren", company="Apple", domain="apple.com"),
+        event=None,
+    )
+    assert context.web_search_status == "usable_results_found"
+    assert context.company_overview_status == "usable_results_found"
+    rendered = render_prep_doc.render(run_prep.context_to_renderer_json(context))
+    assert "What They Do | Known: Apple designs products including iPhone" in rendered
+    assert "company overview could not be enriched" not in rendered
+    assert "Product Modules | To Validate: identify active workload first; possible product modules depend on confirmed use case." in rendered
+    assert "Question Coverage Matrix" not in rendered
+
+
+def test_apple_homepage_nav_text_is_normalized() -> None:
+    raw = "Apple Apple Apple Store Mac iPad iPhone Watch Vision AirPods TV & Home Entertainment Accessories Support 0 + MacBook Neo Amazing Mac. Learn more Buy WWDC 26 Apple Worldwide Developers Conference. Learn more Apple Card Special new Apple Card and AirPods Pro 3 offer."
+    normalized = run_prep.clean_overview_snippet(raw, "Apple")
+    expected = "Apple is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across products such as iPhone, Mac, iPad, Apple Watch, Vision, AirPods, and Apple TV."
+    assert normalized == expected
+    assert "Apple Apple Apple Store" not in normalized
+
+    payload = base_render_payload()
+    payload["customer"] = {
+        "name": "Apple",
+        "contact": "Liel Oren",
+        "domain": "apple.com",
+        "website": "apple.com",
+        "company_name": "Apple",
+        "description": normalized,
+    }
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["source_status"] = {**payload["source_status"], "web_search": "usable_results_found", "company_overview_enrichment": "usable_results_found"}
+    payload["enrichment"] = {
+        "available": True,
+        "dossier": {
+            "company": "Apple",
+            "what_they_do": normalized,
+            "source_evidence": [
+                {
+                    "claim": normalized,
+                    "url": "https://apple.com",
+                    "tier": 1,
+                    "tier_label": "Tier 1 - official company site",
+                    "source_classification": "customer_evidence",
+                }
+            ],
+        },
+    }
+    payload["question_prefill"] = [
+        {
+            "section": "Standard Discovery Questions",
+            "question": "Core business and focus group/user introduction",
+            "answer": normalized,
+            "confidence": "known",
+            "evidence": ["https://apple.com"],
+            "ask_in_meeting": "Confirm exact scope.",
+            "why_it_matters": "Anchors the meeting.",
+        }
+    ]
+    rendered = render_prep_doc.render(payload)
+    assert "What They Do | Known: Apple is a global technology company" in rendered
+    assert "**Core Business Hypothesis:** Apple is a global technology company" in rendered
+    assert "- **Pre-filled answer (Known)**: Apple is a global technology company" in rendered
+    assert "| Core Business | Known: Apple is a global technology company" in rendered
+    assert "Apple Apple Apple Store" not in rendered
+    assert "- company_overview_enrichment: usable_results_found" in rendered
+    assert "Question Coverage Matrix" not in rendered
 
 
 def test_confirmed_domain_does_not_use_narrow_api_page_as_company_overview() -> None:
@@ -1039,7 +1226,7 @@ def test_confirmed_domain_does_not_use_narrow_api_page_as_company_overview() -> 
     payload["enrichment"] = {"available": True, "dossier": {"company": "Apple", "product_modules": ["API / enterprise plans"], "social_content_presence": "paid media / landing-page creative workflow signal found"}}
     rendered = render_prep_doc.render(payload)
     assert "Enterprise Program API is a REST API" not in rendered.split("# Meeting Output Template", 1)[0]
-    assert "Core Business | To Validate: core business." in rendered
+    assert "Core Business | To Validate: business description could not be enriched because web search/fetch was unavailable." in rendered
     assert "Product Modules | To Validate: identify active workload first; possible product modules depend on confirmed use case." in rendered
     assert "Voice/audio generation" not in rendered
     assert "Social / Content / Paid Media Presence | Not Found: no confirmed social or paid-media creative workflow from current sources" in rendered
@@ -1080,6 +1267,238 @@ def test_company_overview_evidence_table_prioritizes_used_source() -> None:
     assert evidence.index("https://www.apple.com/") < evidence.find("https://developer.apple.com/documentation/enterpriseprogramapi") or "https://developer.apple.com/documentation/enterpriseprogramapi" not in evidence
     assert "https://example.com/apple-competitors" not in evidence
     assert "Main AI Use Cases | To Validate: active AI or BytePlus-relevant workload is not confirmed." in rendered
+
+
+def test_apple_official_evidence_populates_overview_and_status() -> None:
+    payload = base_render_payload()
+    payload["customer"] = {
+        "name": "Apple",
+        "contact": "Liel Oren",
+        "domain": "apple.com",
+        "website": "apple.com",
+        "company_name": "Apple",
+        "description": "To Validate: business description could not be enriched because web search/fetch was unavailable.",
+    }
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["source_status"] = {**payload["source_status"], "web_search": "ran_but_all_results_filtered"}
+    payload["enrichment"] = {
+        "available": True,
+        "dossier": {
+            "company": "Apple",
+            "what_they_do": "To Validate: business description could not be enriched because web search/fetch was unavailable.",
+            "source_evidence": [
+                {
+                    "claim": "Discover the innovative world of Apple and shop iPhone, iPad, Apple Watch, Mac, and services.",
+                    "url": "https://www.apple.com/",
+                    "tier": 1,
+                    "tier_label": "Tier 1 - official company site",
+                    "source_classification": "customer_evidence",
+                },
+                {
+                    "claim": "Discover Oren Apple on LinkMe.",
+                    "url": "https://link.me/oren_2025",
+                    "tier": 4,
+                    "tier_label": "Tier 4 - public web/news/review",
+                    "source_classification": "generic_market_reference",
+                },
+            ],
+        },
+    }
+    payload["question_prefill"] = [
+        {
+            "section": "Standard Discovery Questions",
+            "question": "Core business and focus group/user introduction",
+            "answer": "To Validate: business description could not be enriched because web search/fetch was unavailable.",
+            "confidence": "known",
+            "evidence": [],
+            "ask_in_meeting": "Confirm scope.",
+            "why_it_matters": "Anchors the meeting.",
+        }
+    ]
+    rendered = render_prep_doc.render(payload)
+    assert "What They Do | Known: Apple is a global technology company" in rendered
+    assert "**Core Business Hypothesis:** Apple is a global technology company" in rendered
+    assert "| Core Business | Known: Apple is a global technology company" in rendered
+    assert "- **Pre-filled answer (Known)**: Apple is a global technology company" in rendered
+    assert "- web_search: ran_but_all_results_filtered" not in rendered
+    assert "- web_search: usable_results_found" in rendered
+    assert "https://link.me/oren_2025" not in rendered.split("## Evidence Table", 1)[1]
+    assert "Question Coverage Matrix" not in rendered
+
+
+def test_contact_company_link_aggregator_noise_is_not_company_evidence() -> None:
+    assert run_prep.classify_source(
+        "https://link.me/oren_2025",
+        "Check out Oren Apple (@oren_2025) on Linkme",
+        "Discover Oren Apple on LinkMe.",
+        "Apple",
+        confirmed_domain="apple.com",
+        contact_name="Liel Oren",
+    ) == "generic_market_reference"
+
+
+def test_keshet_confirmed_media_company_uses_official_evidence_and_gates_ai_workload() -> None:
+    dossier = run_prep.extract_company_dossier(
+        "Keshet Media Group",
+        "Keshet International is Keshet Media Group's global distribution and production arm.",
+        [],
+        [
+            {
+                "title": "Keshet International",
+                "url": "https://www.keshetinternational.com/",
+                "snippet": "Keshet International is Keshet Media Group's global distribution and production arm for broadcasters, streamers, content buyers, format licensing, global distribution, and production partners.",
+            },
+            {
+                "title": "Keshet Media Group Company Profile",
+                "url": "https://www.crunchbase.com/organization/keshet-media-group",
+                "snippet": "Keshet Media Group profile.",
+            },
+        ],
+        [],
+        customer_name="Tal Geifman",
+        confirmed_domain="keshetinternational.com",
+    )
+    assert dossier["source_evidence"][0]["url"] == "https://www.keshetinternational.com/"
+    assert dossier["source_evidence"][0]["tier_label"] == "Tier 1 - official company site"
+    assert "broadcasters/streamers" in dossier["target_users"]
+    assert "broadcasting, streaming" in dossier["business_model"]
+
+    payload = base_render_payload()
+    payload["customer"] = {
+        "name": "Keshet Media Group",
+        "contact": "Tal Geifman",
+        "company_name": "Keshet Media Group",
+        "domain": "keshetinternational.com",
+        "website": "keshetinternational.com",
+    }
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["enrichment"] = {
+        "available": True,
+        "source_links": [{"url": "https://www.keshetinternational.com/"}],
+        "dossier": dossier,
+    }
+    payload["question_prefill"] = [
+        {
+            "section": "Standard Discovery Questions",
+            "question": "Core business and focus group/user introduction",
+            "answer": "Known: lower-tier fallback should not be used.",
+            "confidence": "known",
+            "evidence": ["https://www.crunchbase.com/organization/keshet-media-group"],
+            "ask_in_meeting": "Can you confirm meeting scope?",
+            "why_it_matters": "Anchors the meeting.",
+        }
+    ]
+    rendered = render_prep_doc.render(payload)
+    assert "What They Do | Known: Keshet Media Group is a media and entertainment company with broadcasting, streaming, production, news, and international content distribution businesses. Evidence: https://www.keshetinternational.com/." in rendered
+    assert "- **Evidence**: https://www.keshetinternational.com/" in rendered
+    assert "Target Users / Customer Segments | Likely: TV/streaming audiences, broadcasters/streamers, production partners, content buyers, and media partners (?)" in rendered
+    assert "Business Model / Revenue Model | Likely: broadcasting, streaming, content production, format licensing/global distribution, and media partnerships (?)" in rendered
+    assert "Main AI Use Cases | To Validate: active AI or BytePlus-relevant workload is not confirmed." in rendered
+    assert "Seedance: Validate fit" not in rendered
+    assert "Question Coverage Matrix" not in rendered
+
+
+def test_ipg_confirmed_company_overview_enriches_business_but_gates_workload() -> None:
+    snippet = (
+        "Interpublic Group (IPG) is a global advertising and marketing services holding company with agency networks "
+        "across creative, media, data, technology, communications, brand marketing, and media buying services. "
+        "Public financial sources indicate $10.9 billion revenue."
+    )
+    dossier = run_prep.extract_company_dossier(
+        "Interpublic Group (IPG)",
+        snippet,
+        [],
+        [{"title": "Interpublic Group", "url": "https://www.interpublic.com/", "snippet": snippet}],
+        [],
+        customer_name="Juan manuel Sepulveda",
+        confirmed_domain="interpublic.com",
+        contact_name="Juan manuel Sepulveda",
+    )
+    assert dossier["what_they_do"].startswith("Interpublic Group (IPG) is a global advertising and marketing services holding company")
+    assert "global brands" in dossier["target_users"]
+    assert "media planning/buying" in dossier["business_model"]
+    assert any("billion" in item.lower() for item in dossier["scale_signals"])
+    assert "Official company overview" not in str(dossier["source_evidence"])
+
+    payload = base_render_payload()
+    payload["customer"] = {
+        "name": "Interpublic Group (IPG)",
+        "contact": "Juan manuel Sepulveda",
+        "company_name": "Interpublic Group (IPG)",
+        "domain": "interpublic.com",
+        "website": "interpublic.com",
+        "description": dossier["what_they_do"],
+    }
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {
+        "name": "marketing_adtech",
+        "display_name": "Marketing / AdTech",
+        "confidence": "likely",
+        "evidence": ["Matched signal: advertising", "Matched signal: marketing services"],
+    }
+    payload["source_status"] = {**payload["source_status"], "web_search": "usable_results_found", "company_overview_enrichment": "usable_results_found"}
+    payload["enrichment"] = {
+        "available": True,
+        "known_use_cases": [],
+        "possible_byteplus_fit": [
+            {"product": "Ark / model platform", "reason": "Should stay gated without workload evidence", "confidence": "medium"}
+        ],
+        "dossier": dossier,
+    }
+    rendered = render_prep_doc.render(payload)
+    forbidden = [
+        "Official company overview",
+        "Generic company overview",
+        "Normalized overview",
+        "Overview unavailable",
+        "To Validate: To Validate",
+        "Question Coverage Matrix",
+    ]
+    for value in forbidden:
+        assert value not in rendered
+    assert "Juan manuel Sepulveda at Interpublic Group (IPG)" in rendered
+    assert "What They Do | Known: Interpublic Group (IPG) is a global advertising and marketing services holding company" in rendered
+    assert "Target Users / Customer Segments | Likely: global brands, advertisers, enterprise marketing teams, media buyers, and agency clients (?)" in rendered
+    assert "Business Model / Revenue Model | Likely: advertising, marketing services, media planning/buying" in rendered
+    assert "Main AI Use Cases | To Validate: no confirmed AI workload or BytePlus use case found from current sources." in rendered
+    assert "Product Modules | To Validate: identify active workload first; possible product modules depend on confirmed use case." in rendered
+    assert "Expansion Opportunity | To Validate: identify active workload first." in rendered
+    assert "Likely: Ark / model platform" not in rendered
+
+
+def test_hq_location_extraction_does_not_include_revenue_phrase() -> None:
+    dossier = run_prep.extract_company_dossier(
+        "Example Media",
+        "Example Media is based in Tel - Aviv with an estimated revenue of $10M.",
+        [],
+        [],
+        [],
+        confirmed_domain="example.com",
+    )
+    assert dossier["hq"] == "Tel Aviv"
+    assert "revenue" not in dossier["hq"].lower()
+
+
+def test_budget_status_avoids_raw_business_tier_wording() -> None:
+    dossier = run_prep.extract_company_dossier(
+        "Keshet Media Group",
+        "Keshet Media Group is a media business.",
+        [],
+        [{"title": "Keshet Media Group", "url": "https://www.keshetinternational.com/", "snippet": "Keshet Media Group is a media business."}],
+        [],
+        confirmed_domain="keshetinternational.com",
+    )
+    assert dossier["pricing_tiers"] == []
+
+    payload = base_render_payload()
+    payload["known"] = {"budget_status": "To Validate: public customer packaging terms were found, but actual AI infra spend, vendor commitments, budget owner, and BytePlus-relevant commitment are not confirmed."}
+    payload["enrichment"] = {"available": True, "dossier": {"pricing_tiers": ["Business"]}}
+    rendered = render_prep_doc.render(payload)
+    budget = rendered.split("| Budget Status |", 1)[1].split("|", 1)[0]
+    assert "Public pricing/packaging found: Business" not in rendered
+    assert "To Validate:" in budget
 
 
 def test_prior_docs_attribution_distinguishes_candidate_from_usable() -> None:
