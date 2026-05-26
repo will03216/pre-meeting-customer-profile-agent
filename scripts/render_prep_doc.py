@@ -21,6 +21,29 @@ PLACEHOLDER_PATTERNS = (
     "to validate: to validate",
 )
 
+VERTICAL_SUBTYPE_TEMPLATES = {
+    "agency_marketing_services": {
+        "target_users": "global brands, advertisers, enterprise marketing teams, media buyers, and agency clients",
+        "business_model": "advertising, marketing services, media planning/buying, creative services, communications, data/technology-enabled marketing, and agency network services",
+    },
+    "intent_marketing_comparison": {
+        "target_users": "high-intent consumers, brand/advertiser partners, and publishers",
+        "business_model": "lead generation, affiliate/referral, comparison content, performance marketing, and brand partnerships",
+    },
+    "media_entertainment_content": {
+        "target_users": "TV/streaming audiences, broadcasters/streamers, production partners, content buyers, and media partners",
+        "business_model": "broadcasting, streaming, content production, format licensing/global distribution, and media partnerships",
+    },
+    "consumer_technology": {
+        "target_users": "consumers, developers, enterprise customers, creative professionals, and ecosystem partners",
+        "business_model": "hardware sales, software/services revenue, app ecosystem, subscriptions, accessories, and support",
+    },
+    "creative_platform": {
+        "target_users": "creators, designers, marketers, agencies, enterprise creative teams, and API developers",
+        "business_model": "subscriptions, credits, asset licensing, API usage, enterprise/team plans, and creative tools",
+    },
+}
+
 
 def contains_placeholder(text: str | None) -> bool:
     lowered = (text or "").lower()
@@ -45,13 +68,17 @@ def normalize_overview_claim(claim: str, company_name: str | None = None, url: s
     company = (company_name or "").lower()
     if contains_placeholder(clean):
         return ""
-    if (company == "apple" or "apple.com" in lowered) and any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv", "vision")):
-        return "Apple is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across products such as iPhone, Mac, iPad, Apple Watch, Vision, AirPods, and Apple TV."
+    if any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv", "vision", "consumer devices")):
+        return f"{company_name or 'The company'} is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across major product and ecosystem categories."
     compact_company = "".join(ch for ch in company if ch.isalnum())
-    if compact_company in {"interpublicgroupipg", "interpublicgroup", "ipg"} or any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing", "mccann", "fcb", "ipg mediabrands")):
-        return "Interpublic Group (IPG) is a global advertising and marketing services holding company with agency networks across creative, media, data, technology, communications, and brand marketing services."
-    if "keshet" in compact_company or any(term in lowered for term in ("keshet broadcasting", "keshet 12", "streaming service", "content distribution", "international content", "media company")):
-        return "Keshet Media Group is a media and entertainment company with broadcasting, streaming, production, news, and international content distribution businesses."
+    if any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing")):
+        return f"{company_name or 'The company'} is an advertising and marketing services company with capabilities across creative, media, data, technology, communications, and brand marketing services."
+    if any(term in lowered for term in ("media and entertainment", "broadcasting", "streaming service", "content distribution", "international content", "media company", "format licensing", "global distribution and production")):
+        return f"{company_name or 'The company'} is a media and entertainment company with broadcasting, streaming, production, news, and international content distribution businesses."
+    if any(term in lowered for term in ("intent marketing", "comparison platform", "customer acquisition", "purchase decisions")):
+        return f"{company_name or 'The company'} is an intent-marketing and customer-acquisition company focused on connecting consumers with brands through comparison and performance marketing platforms."
+    if any(term in lowered for term in ("creative platform", "stock assets", "design assets", "templates", "image generation", "video generation", "ai-enabled image")):
+        return f"{company_name or 'The company'} is a creative platform offering design assets, templates, and AI-enabled image/video tools for creators, marketers, agencies, and enterprise creative teams."
     return "" if raw_nav_or_placeholder_claim(clean) else clean
 
 
@@ -203,6 +230,9 @@ def best_evidence_url(data: dict) -> str:
     customer = data.get("customer") or {}
     company_domain = (customer.get("website") or customer.get("domain") or "").lower().removeprefix("www.")
     dossier = enrichment.get("dossier") or {}
+    for item in evidence_rows_for_current_run(data):
+        if item.get("claim_type") == "company_overview" and item.get("source_classification", "customer_evidence") == "customer_evidence":
+            return item.get("source_url") or item.get("url") or ""
     for item in dossier.get("source_evidence") or []:
         url = item.get("url") or ""
         host = url.lower().split("/")[2].removeprefix("www.") if "://" in url else url.lower().split("/")[0].removeprefix("www.")
@@ -240,6 +270,22 @@ def best_evidence_url(data: dict) -> str:
             return (1 + purpose_penalty, source_rank(url))
         return (source_rank(url), 0)
     return sorted(dict.fromkeys(urls), key=rank)[0]
+
+
+def evidence_rows_for_current_run(data: dict) -> list[dict]:
+    run_id = data.get("run_id")
+    customer_key = data.get("customer_key")
+    registry = data.get("evidence_registry") or []
+    rows = []
+    for item in registry:
+        if run_id and item.get("run_id") != run_id:
+            continue
+        if customer_key and item.get("customer_key") != customer_key:
+            continue
+        rows.append(item)
+    if rows:
+        return rows
+    return ((data.get("enrichment") or {}).get("dossier") or {}).get("source_evidence") or []
 
 
 def usable_prior_docs(prior_docs: list[dict]) -> list[dict]:
@@ -305,14 +351,36 @@ def confirmed_company_context(data: dict) -> bool:
     return customer_context_classification(data) == "confirmed_company"
 
 
+def confidence_layers(data: dict) -> dict:
+    layers = data.get("confidence_layers") or {}
+    if layers:
+        return layers
+    return {
+        "identity_confidence": "confirmed_company" if confirmed_company_context(data) else ("weak_person_only" if weak_identity(data) else "unknown"),
+        "company_vertical_confidence": (data.get("vertical") or {}).get("confidence") or "unknown",
+        "active_workload_confidence": "likely" if (data.get("enrichment") or {}).get("known_use_cases") else "unknown",
+        "product_fit_confidence": "likely" if (data.get("enrichment") or {}).get("known_use_cases") and (data.get("enrichment") or {}).get("possible_byteplus_fit") else "possible_after_validation",
+    }
+
+
+def active_workload_confirmed(data: dict) -> bool:
+    return confidence_layers(data).get("active_workload_confidence") in {"likely", "confirmed"}
+
+
+def product_fit_allowed(data: dict) -> bool:
+    return confidence_layers(data).get("product_fit_confidence") in {"likely", "confirmed"} and active_workload_confirmed(data)
+
+
 def official_company_overview_evidence(data: dict) -> dict | None:
     dossier = ((data.get("enrichment") or {}).get("dossier") or {})
     company_name = ((data.get("customer") or {}).get("company_name") or dossier.get("company") or (data.get("customer") or {}).get("name"))
-    for item in dossier.get("source_evidence") or []:
+    for item in evidence_rows_for_current_run(data):
+        if item.get("claim_type") and item.get("claim_type") != "company_overview":
+            continue
         if item.get("source_classification", "customer_evidence") != "customer_evidence":
             continue
         tier = str(item.get("tier_label") or "")
-        url = str(item.get("url") or "").lower()
+        url = str(item.get("source_url") or item.get("url") or "").lower()
         path = "/" + "/".join(url.split("/")[3:]) if "://" in url else ""
         path = path.rstrip("/")
         if "Tier 1 - official company site" not in tier:
@@ -323,8 +391,8 @@ def official_company_overview_evidence(data: dict) -> dict | None:
             continue
         if path not in {"", "/", "/about", "/company", "/about-us", "/newsroom"} and "/about-" not in path:
             continue
-        claim = str(item.get("claim") or "").strip()
-        claim = normalize_overview_claim(claim, company_name, item.get("url") or "")
+        claim = str(item.get("claim_text") or item.get("claim") or "").strip()
+        claim = normalize_overview_claim(claim, company_name, item.get("source_url") or item.get("url") or "")
         if claim:
             clean_item = dict(item)
             clean_item["claim"] = claim
@@ -359,22 +427,75 @@ def gated_core_business(data: dict, customer_name: str, source: str = "") -> str
     return dossier.get("what_they_do") or customer.get("description") or "To Validate: core business."
 
 
+def core_business_label_and_evidence(data: dict, core_business: str | None = None) -> tuple[str, str]:
+    enrichment = data.get("enrichment") or {}
+    dossier = enrichment.get("dossier") or {}
+    text = core_business if core_business is not None else gated_core_business(data, (data.get("customer") or {}).get("name") or "the customer")
+    if weak_identity(data) or str(text or "").startswith("To Validate:"):
+        return "to_validate", "Not Found"
+    source = best_evidence_url(data)
+    if source:
+        return "known", source
+    if str(dossier.get("what_they_do_confidence") or "").lower() == "likely" or text:
+        return "likely", "Not Found"
+    return "to_validate", "Not Found"
+
+
+def evidence_subtype_name(data: dict) -> str:
+    enrichment = data.get("enrichment") or {}
+    dossier = enrichment.get("dossier") or {}
+    subtype = dossier.get("vertical_subtype") or (data.get("vertical") or {}).get("subtype") or {}
+    if isinstance(subtype, dict):
+        return str(subtype.get("name") or "")
+    return ""
+
+
+def incompatible_evidence_claim(claim: str, data: dict) -> bool:
+    lowered = (claim or "").lower()
+    if not lowered:
+        return True
+    if weak_identity(data):
+        return True
+    subtype = evidence_subtype_name(data)
+    blocked = {
+        "media_entertainment_content": ("consumer devices", "accessories", "app ecosystem", "app store", "hardware sales", "iphone", "ipad", "mac", "apple watch", "intent-marketing", "comparison-platform", "comparison platform", "high-intent consumers"),
+        "agency_marketing_services": ("consumer devices", "hardware sales", "app ecosystem", "app store", "accessories", "intent-marketing", "comparison-platform", "comparison platform", "high-intent consumers", "broadcasting", "format licensing"),
+        "intent_marketing_comparison": ("consumer devices", "hardware sales", "app ecosystem", "app store", "accessories", "agency network services", "broadcasting", "streaming", "format licensing"),
+        "creative_platform": ("consumer devices", "hardware sales", "app ecosystem", "app store", "accessories", "broadcasting", "format licensing", "intent-marketing", "comparison-platform", "comparison platform"),
+        "consumer_technology": ("intent-marketing", "comparison-platform", "comparison platform", "high-intent consumers", "agency network services", "broadcasting", "format licensing", "creative-platform packaging"),
+    }
+    return any(term in lowered for term in blocked.get(subtype, ()))
+
+
+def add_field_validation_warning(data: dict, warning: str) -> None:
+    status = data.setdefault("source_status", {})
+    existing = str(status.get("field_validation") or "")
+    parts = [part.strip() for part in existing.split(";") if part.strip()]
+    if warning not in parts:
+        parts.append(warning)
+    status["field_validation"] = "; ".join(parts)
+
+
 def effective_use_cases(data: dict) -> list[str]:
-    if weak_identity(data) or weak_or_unknown_vertical(data):
+    if weak_identity(data) or not active_workload_confirmed(data):
         return ["To Validate: active AI or BytePlus-relevant workload is not confirmed."]
     enrichment = data.get("enrichment") or {}
+    vertical_name = (data.get("vertical") or {}).get("name")
+    if not enrichment.get("known_use_cases") and vertical_name == "ai_video_creative":
+        return ["Likely: image/video creative generation, editing, or batch production workflow (?)"]
+    if not enrichment.get("known_use_cases") and data.get("explicit_workload"):
+        return [f"Likely: {str(data.get('explicit_workload')).replace('_', ' ')} workload (?)"]
     return enrichment.get("known_use_cases") or ["To Validate: no confirmed AI workload or BytePlus use case found from current sources."]
 
 
 def effective_product_fit(data: dict) -> list[dict]:
-    if weak_identity(data) or weak_or_unknown_vertical(data):
+    if weak_identity(data) or not product_fit_allowed(data):
         return []
     enrichment = data.get("enrichment") or {}
-    vertical_confidence = (data.get("vertical") or {}).get("confidence")
-    if not enrichment.get("known_use_cases") and vertical_confidence != "confirmed":
+    vertical_name = (data.get("vertical") or {}).get("name")
+    if not enrichment.get("known_use_cases") and vertical_name != "ai_video_creative" and not data.get("explicit_workload"):
         return []
     fit = enrichment.get("possible_byteplus_fit") or []
-    vertical_name = (data.get("vertical") or {}).get("name")
     fallback_only = not enrichment.get("available", False)
     if fit and not fallback_only:
         return fit
@@ -428,15 +549,15 @@ def validation_gap() -> str:
 
 
 def risk_note(data: dict) -> str:
-    if weak_identity(data) or weak_or_unknown_vertical(data):
+    if weak_identity(data) or not active_workload_confirmed(data):
         return f"To Validate: {validation_gap()}"
     return likely_list((data.get("enrichment") or {}).get("known_risks"), "To Validate: risks and blockers")
 
 
 def pain_points_note(data: dict) -> str:
     known = data.get("known") or {}
-    if weak_identity(data) or weak_or_unknown_vertical(data):
-        return "To Validate: no confirmed pain point found. Missing budget, decision maker, timeline, current vendor, and success metrics should be validated in the meeting."
+    if weak_identity(data) or not active_workload_confirmed(data):
+        return "To Validate: confirm whether the customer is focused on creative production, media optimization, workflow automation, model/API infrastructure, cost, quality, latency, or deployment."
     if known.get("pain_points"):
         return known["pain_points"]
     return likely_list((data.get("enrichment") or {}).get("known_risks"), "To Validate: pain points")
@@ -482,7 +603,7 @@ def derive_questions(data: dict) -> list[str]:
             "Who owns the technical and commercial decision?",
             "What would make a next step or POC worthwhile?",
         ]
-    if weak_or_unknown_vertical(data):
+    if weak_or_unknown_vertical(data) or not active_workload_confirmed(data):
         return [
             "Can you confirm the meeting scope and which team/product this discussion is for?",
             "What active AI or BytePlus-relevant workload should we discuss?",
@@ -513,12 +634,15 @@ def executive_snapshot(data: dict, customer_name: str, company_name: str | None,
     vertical = data.get("vertical") or {}
     company = company_name or customer_name
     core_business = gated_core_business(data, customer_name)
+    core_label, _core_evidence = core_business_label_and_evidence(data, core_business)
+    core_business_labeled = labeled_text(core_business, core_label, evidence="" if _core_evidence == "Not Found" else _core_evidence)
     use_cases = effective_use_cases(data)
     vertical = data.get("vertical") or {}
     prospecting = data.get("prospecting") or {}
     fit_lines = product_fit_lines(data)
     contact_name = customer.get("contact") or ""
     display_name = f"{contact_name} at {company_name or customer_name}" if contact_name and (company_name or customer_name) else customer_name + (f" at {company_name}" if company_name else "")
+    layers = confidence_layers(data)
 
     validate = questions[:4]
     while len(validate) < 4:
@@ -530,7 +654,7 @@ def executive_snapshot(data: dict, customer_name: str, company_name: str | None,
             "",
             f"**Likely Customer / Company:** {display_name}",
             "",
-            f"**Core Business Hypothesis:** {core_business}",
+            f"**Core Business Hypothesis:** {core_business_labeled}",
             "",
             "**Likely AI Workloads:**",
             *[f"- {item}" for item in use_cases[:5]],
@@ -540,6 +664,10 @@ def executive_snapshot(data: dict, customer_name: str, company_name: str | None,
             "",
             "**Known / Inferred Signals:**",
             f"- Detected vertical: {vertical.get('display_name') or 'To Validate'} ({confidence_label(vertical.get('confidence'))})",
+            f"- Identity confidence: {layers.get('identity_confidence') or 'unknown'}",
+            f"- Company vertical confidence: {layers.get('company_vertical_confidence') or 'unknown'}",
+            f"- Active workload confidence: {layers.get('active_workload_confidence') or 'unknown'}",
+            f"- Product fit confidence: {layers.get('product_fit_confidence') or 'unknown'}",
             f"- Vertical evidence: {join_non_empty(vertical.get('evidence'), fallback='Not Found')}",
             f"- Website: {customer.get('website') or 'To Validate'}",
             f"- Stakeholder context: {known.get('stakeholder_context') or 'To Validate'}",
@@ -560,8 +688,7 @@ def company_dossier_section(data: dict) -> str:
     vertical = data.get("vertical") or {}
     is_unknown_vertical = unknown_vertical(vertical)
     vertical_name = vertical.get("name") or "default"
-    vertical_confidence = vertical.get("confidence")
-    workload_confirmed = bool((enrichment.get("known_use_cases") or [])) or vertical_confidence == "confirmed"
+    workload_confirmed = active_workload_confirmed(data)
     context_class = customer_context_classification(data)
     what_they_do = (
         str(official_overview.get("claim") or "").strip()
@@ -575,26 +702,32 @@ def company_dossier_section(data: dict) -> str:
     raw_target_users = dossier.get("target_users") or ""
     raw_business_model = dossier.get("business_model") or ""
     overview_lower = str(what_they_do or "").lower()
+    subtype = dossier.get("vertical_subtype") or (vertical.get("subtype") or {})
+    subtype_name = subtype.get("name") if isinstance(subtype, dict) else ""
     if confirmed_company_context(data) and not raw_target_users:
-        if any(term in overview_lower for term in ("global advertising", "marketing services", "agency network", "media buying", "brand marketing")):
-            raw_target_users = "global brands, advertisers, enterprise marketing teams, media buyers, and agency clients"
+        if subtype_name in VERTICAL_SUBTYPE_TEMPLATES:
+            raw_target_users = VERTICAL_SUBTYPE_TEMPLATES[subtype_name]["target_users"]
+        elif any(term in overview_lower for term in ("global advertising", "marketing services", "agency network", "media buying", "brand marketing")):
+            raw_target_users = VERTICAL_SUBTYPE_TEMPLATES["agency_marketing_services"]["target_users"]
         elif any(term in overview_lower for term in ("media and entertainment", "broadcasting", "streaming", "content distribution", "production")):
-            raw_target_users = "TV/streaming audiences, broadcasters/streamers, production partners, content buyers, and media partners"
+            raw_target_users = VERTICAL_SUBTYPE_TEMPLATES["media_entertainment_content"]["target_users"]
         elif any(term in overview_lower for term in ("global technology company", "consumer devices", "iphone", "mac", "ipad", "app store")):
-            raw_target_users = "consumers, developers, enterprise customers, creative professionals, and ecosystem partners"
+            raw_target_users = VERTICAL_SUBTYPE_TEMPLATES["consumer_technology"]["target_users"]
         elif any(term in overview_lower for term in ("intent-marketing", "customer-acquisition", "comparison", "performance marketing")):
-            raw_target_users = "high-intent consumers, brand/advertiser partners, and publishers"
+            raw_target_users = VERTICAL_SUBTYPE_TEMPLATES["intent_marketing_comparison"]["target_users"]
     if confirmed_company_context(data) and not raw_business_model:
-        if any(term in overview_lower for term in ("global advertising", "marketing services", "agency network", "media buying", "brand marketing")):
-            raw_business_model = "advertising, marketing services, media planning/buying, creative services, data/technology-enabled marketing, communications, and agency network services"
+        if subtype_name in VERTICAL_SUBTYPE_TEMPLATES:
+            raw_business_model = VERTICAL_SUBTYPE_TEMPLATES[subtype_name]["business_model"]
+        elif any(term in overview_lower for term in ("global advertising", "marketing services", "agency network", "media buying", "brand marketing")):
+            raw_business_model = VERTICAL_SUBTYPE_TEMPLATES["agency_marketing_services"]["business_model"]
         elif any(term in overview_lower for term in ("media and entertainment", "broadcasting", "streaming", "content distribution", "production")):
-            raw_business_model = "broadcasting, streaming, content production, format licensing/global distribution, and media partnerships"
+            raw_business_model = VERTICAL_SUBTYPE_TEMPLATES["media_entertainment_content"]["business_model"]
         elif any(term in overview_lower for term in ("global technology company", "consumer devices", "iphone", "mac", "ipad", "app store")):
-            raw_business_model = "hardware sales, software/services revenue, App Store ecosystem, subscriptions, accessories, and support"
+            raw_business_model = VERTICAL_SUBTYPE_TEMPLATES["consumer_technology"]["business_model"]
         elif any(term in overview_lower for term in ("intent-marketing", "customer-acquisition", "comparison", "performance marketing")):
-            raw_business_model = "intent-marketing / comparison-platform model connecting consumers, publishers, and brands"
+            raw_business_model = VERTICAL_SUBTYPE_TEMPLATES["intent_marketing_comparison"]["business_model"]
     marketing_leak_terms = ("high-intent", "comparison-platform", "comparison platform", "intent-marketing", "intent marketing")
-    if vertical_name == "ai_video_creative":
+    if vertical_name == "ai_video_creative" and workload_confirmed:
         if not raw_target_users or any(term in raw_target_users.lower() for term in marketing_leak_terms):
             target_users = "creators, designers, marketers, agencies, enterprise creative teams, and API developers"
         else:
@@ -610,9 +743,9 @@ def company_dossier_section(data: dict) -> str:
         else:
             business_model = raw_business_model
     else:
-        target_users = raw_target_users or ("target users/customer segments are not confirmed from available sources" if is_unknown_vertical else "high-intent consumers and brand/advertiser partners are relevant based on intent-marketing and comparison-platform positioning")
+        target_users = raw_target_users or "target users/customer segments are not confirmed from available sources"
         traffic, traffic_label = traffic_source_note(dossier.get("traffic_source_scale"))
-        business_model = raw_business_model or ("business model/revenue model is not confirmed from available sources" if is_unknown_vertical else "intent-marketing / comparison-platform model connecting consumers with brands")
+        business_model = raw_business_model or "business model/revenue model is not confirmed from available sources"
     social_presence = dossier.get("social_content_presence") or "no confirmed social or paid-media creative workflow from current sources"
     if weak_or_unknown_vertical(data):
         social_presence = "no confirmed social or paid-media creative workflow from current sources"
@@ -636,23 +769,34 @@ def company_dossier_section(data: dict) -> str:
         else (what_they_do or ("To Validate: business description could not be enriched because web search/fetch was unavailable." if confirmed_company_context(data) else "To Validate: core business."))
     )
     what_text = str(what_they_do_value or "").strip().lower()
-    what_they_do_label = "to_validate" if weak_identity(data) or not source or what_text.startswith("to validate") else "known"
+    explicit_what_confidence = str(dossier.get("what_they_do_confidence") or "").lower()
+    if explicit_what_confidence in {"likely", "known", "to_validate", "not_found"}:
+        what_they_do_label = explicit_what_confidence
+    else:
+        what_they_do_label = "to_validate" if weak_identity(data) or not source or what_text.startswith("to validate") else "known"
     target_label = "to_validate" if is_unknown_vertical and not raw_target_users else "likely"
     business_model_label = "to_validate" if is_unknown_vertical and not raw_business_model else "likely"
+    if "not confirmed" in str(target_users).lower():
+        target_label = "to_validate"
+    if "not confirmed" in str(business_model).lower():
+        business_model_label = "to_validate"
     if vertical_name == "ai_video_creative":
         target_label = "likely"
         business_model_label = "likely"
+    product_modules_value = dossier.get("product_modules")
+    if workload_confirmed and vertical_name == "ai_video_creative" and not product_modules_value:
+        product_modules_value = ["AI image/video generation", "Creative asset editing", "API / enterprise workflow to validate"]
     rows = [
         *rows,
         ("Website", labeled_text(customer.get("website"), "known", fallback=TO_VALIDATE)),
         ("What They Do", normalized_person_background(what_they_do_value, customer_name, source) if context_class in {"person_only", "candidate_company"} and not weak_identity(data) else labeled_text(what_they_do_value, what_they_do_label, fallback=TO_VALIDATE, evidence="" if (weak_identity(data) or what_they_do_label == "to_validate") else source)),
         ("Detected Industry", labeled_text(vertical.get("display_name"), "known" if vertical.get("confidence") == "confirmed" else ("likely" if vertical.get("confidence") in {"likely", "weak"} else "to_validate"), fallback="industry not confirmed", evidence=join_non_empty(vertical.get("evidence")))),
-        ("Product Modules", labeled_text([] if (weak_identity(data) or weak_or_unknown_vertical(data) or not workload_confirmed) else dossier.get("product_modules"), "likely", fallback="To Validate: identify active workload first; possible product modules depend on confirmed use case.")),
+        ("Product Modules", labeled_text([] if (weak_identity(data) or not workload_confirmed) else product_modules_value, "likely", fallback="To Validate: identify active workload first; possible product modules depend on confirmed use case.")),
         ("Target Users / Customer Segments", labeled_text(target_users, target_label, followup="Who are the main users or customers: consumers, advertisers, enterprise clients, SMBs, creators, agencies, API developers, or internal teams?")),
         ("Traffic Source / Scale", labeled_text(traffic, traffic_label, followup="Which channels drive most traffic today, and what is the monthly traffic or qualified-lead volume?")),
         ("Key Stakeholders / Buying Role", labeled_text(stakeholder, "to_validate", followup="Could you confirm your role in this evaluation and who owns the technical and commercial decision?")),
         ("Business Model / Revenue Model", labeled_text(business_model, business_model_label, followup="Is the revenue model mainly subscription, credits, API usage, enterprise contracts, lead generation, affiliate/referral, advertising, or partnerships?")),
-        ("Social / Content / Paid Media Presence", labeled_text(social_presence, "not_found" if (weak_or_unknown_vertical(data) or not dossier.get("social_content_presence")) else "likely", followup="Do you produce paid social, landing page, image, or video creative at scale?")),
+        ("Social / Content / Paid Media Presence", labeled_text(social_presence, "not_found" if (not workload_confirmed or not dossier.get("social_content_presence")) else "likely", followup="Do you produce paid social, landing page, image, or video creative at scale?")),
         ("Pricing / Packaging", labeled_text(pricing_packaging_note(dossier.get("pricing_tiers")), "to_validate")),
         ("Scale Signals", labeled_text(dossier.get("scale_signals"), "likely", fallback="Not Found: no scale signals found")),
         ("Founder / Leadership", labeled_text(dossier.get("founders_or_leadership"), "likely", fallback="Not Found: no founder or leadership signal found")),
@@ -672,7 +816,7 @@ def internal_hypothesis_section(data: dict, questions: list[str]) -> str:
         "",
         "- Metric focus to validate: quality, cost per generation, latency, reliability, or enterprise conversion.",
         f"- Likely AI workloads: {join_non_empty(effective_use_cases(data), fallback=TO_VALIDATE)}",
-        f"- Product modules observed: {'To Validate: identify active workload first.' if (weak_identity(data) or weak_or_unknown_vertical(data)) else (known.get('expansion_opportunity') or TO_VALIDATE)}",
+        f"- Product modules observed: {'To Validate: identify active workload first.' if (weak_identity(data) or not active_workload_confirmed(data)) else (known.get('expansion_opportunity') or TO_VALIDATE)}",
         f"- Possible pain points: {pain_points_note(data)}",
         f"- Current vendors / competitors to validate: {join_non_empty(enrichment.get('known_competitors'), fallback='Not found in available sources')}",
         f"- Public scale signal: {known.get('monthly_volume') or known.get('paid_users') or 'Not found in available sources'}",
@@ -707,16 +851,23 @@ def render_question_prefill_sections(data: dict) -> str:
             evidence_text = "Not Found" if not evidence else "; ".join(str(x) for x in evidence[:2])
             answer = val(item.get("answer"), "Not Found.")
             confidence = item.get("confidence")
-            if (weak_identity(data) or weak_or_unknown_vertical(data)) and confidence in {"known", "likely"}:
-                question_text = val(item.get("question"))
-                if "core business" in question_text.lower() and not weak_identity(data):
-                    answer = gated_core_business(data, (data.get("customer") or {}).get("name") or "the customer")
-                    confidence = "known" if not answer.startswith("To Validate:") else "to_validate"
-                    evidence_text = best_evidence_url(data) if confidence == "known" else "Not Found"
-                else:
-                    confidence = "to_validate"
-                    answer = "To Validate: active AI or BytePlus-relevant workload is not confirmed."
-                    evidence_text = "Not Found"
+            existing_answer_label, answer_clean = strip_confidence_prefix(answer)
+            if existing_answer_label:
+                answer = answer_clean
+            question_text = val(item.get("question"))
+            section_text = val(item.get("section"), "")
+            if "core business" in question_text.lower() and not weak_identity(data):
+                answer = gated_core_business(data, (data.get("customer") or {}).get("name") or "the customer")
+                confidence, core_evidence = core_business_label_and_evidence(data, answer)
+                evidence_text = core_evidence
+            workload_specific = any(
+                term in f"{section_text} {question_text}".lower()
+                for term in ("image", "video", "llm", "model", "vendor", "generation", "cross-sell", "usage", "stack")
+            )
+            if (weak_identity(data) or weak_or_unknown_vertical(data) or (not active_workload_confirmed(data) and workload_specific)) and confidence in {"known", "likely"} and "core business" not in question_text.lower():
+                confidence = "to_validate"
+                answer = "To Validate: active AI or BytePlus-relevant workload is not confirmed."
+                evidence_text = "Not Found"
             if confidence == "likely" and "(?)" not in answer:
                 answer += " (?)"
             question = val(item.get("question"))
@@ -745,25 +896,46 @@ def evidence_table(data: dict) -> str:
     customer = data.get("customer") or {}
     company_name = customer.get("company_name") or dossier.get("company") or customer.get("name")
     primary = best_evidence_url(data)
-    evidence = [
-        item for item in (dossier.get("source_evidence") or [])
-        if item.get("source_classification", "customer_evidence") in {"customer_evidence", "candidate_entity_evidence"}
-        and normalize_overview_claim(str(item.get("claim") or ""), company_name, item.get("url") or "")
-        and "link.me/" not in (item.get("url") or "").lower()
-    ]
+    evidence = []
+    dropped_incompatible = False
+    for item in evidence_rows_for_current_run(data):
+        if item.get("source_classification", "customer_evidence") not in {"customer_evidence", "candidate_entity_evidence"}:
+            continue
+        url = item.get("source_url") or item.get("url") or ""
+        if "link.me/" in url.lower():
+            continue
+        claim = normalize_overview_claim(str(item.get("claim_text") or item.get("claim") or ""), company_name, url)
+        if not claim:
+            continue
+        if incompatible_evidence_claim(claim, data):
+            dropped_incompatible = True
+            continue
+        clean_item = dict(item)
+        clean_item["claim_text"] = claim
+        clean_item["claim"] = claim
+        evidence.append(clean_item)
+    if dropped_incompatible:
+        add_field_validation_warning(data, "dropped_incompatible_evidence_row")
     if weak_or_unknown_vertical(data):
         evidence = [
             item for item in evidence
-            if not any(marker in (item.get("url") or "").lower() for marker in ("developer.", "/api", "pricing", "billing", "support.", "help."))
+            if not any(marker in (item.get("source_url") or item.get("url") or "").lower() for marker in ("developer.", "/api", "pricing", "billing", "support.", "help."))
         ]
     if primary:
-        evidence = sorted(evidence, key=lambda item: 0 if item.get("url") == primary else 1)
+        evidence = sorted(evidence, key=lambda item: 0 if (item.get("source_url") or item.get("url")) == primary else 1)
     if not evidence:
         return "No evidence table available."
     rows = ["| Claim / Signal | Source Tier | URL |", "| --- | --- | --- |"]
+    seen_claims: set[str] = set()
     for item in evidence[:8]:
-        claim = normalize_overview_claim(str(item.get("claim") or ""), company_name, item.get("url") or "")
-        rows.append(f"| {val(claim)} | {val(item.get('tier_label'))} | {val(item.get('url'))} |")
+        claim = str(item.get("claim_text") or item.get("claim") or "").strip()
+        claim_key = claim.lower().strip()
+        if not claim or claim_key in seen_claims:
+            continue
+        seen_claims.add(claim_key)
+        rows.append(f"| {val(claim)} | {val(item.get('tier_label'))} | {val(item.get('source_url') or item.get('url'))} |")
+    if len(rows) == 2:
+        return "No evidence table available."
     return "\n".join(rows)
 
 
@@ -853,9 +1025,10 @@ def render(data: dict) -> str:
     if first_source:
         source_hint = f" Evidence: {first_source}."
     core_business = gated_core_business(data, customer_name, first_source)
+    core_label, core_evidence = core_business_label_and_evidence(data, core_business)
     output_rows = [
         ("Customer Stage", "Known: Pre-Meeting. Follow-up: confirm meeting objective and decision owners."),
-        ("Core Business", labeled_text(core_business, "to_validate" if weak_identity(data) or core_business.startswith("To Validate:") else ("known" if first_source else "to_validate"), fallback="To Validate: core business.", evidence="" if (weak_identity(data) or core_business.startswith("To Validate:")) else first_source, followup="confirm exact meeting scope and product line.")),
+        ("Core Business", labeled_text(core_business, core_label, fallback="To Validate: core business.", evidence="" if core_evidence == "Not Found" else core_evidence, followup="confirm exact meeting scope and product line.")),
         ("Main AI Use Cases", append_followup(join_non_empty(effective_use_cases(data)), "confirm active workload and priority use case.")),
         ("Current Models", append_followup(val(known.get("current_models"), "Not Found: current models."), "ask whether they use OpenAI, Anthropic, Gemini, Fal, Replicate, Bedrock, Azure, or others.")),
         ("Current Vendors", append_followup(val(known.get("current_vendors"), "Not Found: current vendors."), "ask current LLM/image/video/cloud providers and what they dislike.")),
@@ -890,6 +1063,8 @@ def render(data: dict) -> str:
     enrichment_label = "Web enrichment source" if enrichment.get("source") == "web_search" else "Enriched profile source"
     refs.append(f"- {enrichment_label}: " + (", ".join(s.get("url", s.get("label", "")) for s in source_links) if source_links else "MCP enrichment unavailable or no source link allowed."))
 
+    evidence_table_text = evidence_table(data)
+    source_status = effective_source_status(data)
     unavailable = [f"{k}: {v}" for k, v in source_status.items() if str(v).lower() not in {"available", "ok"}]
     if not unavailable and not enrichment.get("available", False):
         unavailable.append("mcp: unavailable")
@@ -921,7 +1096,7 @@ def render(data: dict) -> str:
             + "\n\n### Case Study (domestic / overseas)\n\n*What you need | For which stakeholder / use case | Domestic or overseas | By when*"
             + "\n\n### Pricing Proposal\n\n*Volume | Commitment term | Models | Competitor price to beat | By when*"
             + "\n\n### Solution Proposal\n\n*What the customer is building | BytePlus products in scope | Technical concerns | Format | By when*",
-            "# Others\n\n## Reference doc\n\n" + "\n".join(refs) + "\n\n## Evidence Table\n\n" + evidence_table(data),
+            "# Others\n\n## Reference doc\n\n" + "\n".join(refs) + "\n\n## Evidence Table\n\n" + evidence_table_text,
             "## Run Report\n\n"
             + ("Unavailable or incomplete sources:\n" + "\n".join(f"- {item}" for item in unavailable) if unavailable else "All declared sources available."),
         ]

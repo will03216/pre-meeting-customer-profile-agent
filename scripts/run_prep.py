@@ -17,6 +17,7 @@ import subprocess
 import sys
 import html
 import time as time_module
+import uuid
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 import urllib.error
 import urllib.request
@@ -124,6 +125,10 @@ class PrepResult:
     customer_name: str | None
     confidence: str
     missing_context: list[str]
+    local_json_path: str = ""
+    local_markdown_path: str = ""
+    run_mode: str = ""
+    lark_doc_status: str = ""
 
 
 class PrepError(RuntimeError):
@@ -148,10 +153,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-json", action="store_true")
     parser.add_argument("--create-doc", action="store_true", help="Explicitly allow new doc creation; this is the default outside dry-run.")
+    parser.add_argument("--no-create-doc", action="store_true", help="Generate local markdown/json only; skip Lark doc creation or update.")
     parser.add_argument("--update-existing", action="store_true")
     parser.add_argument("--no-notify", action="store_true")
     parser.add_argument("--prospecting-prompt", help="Path to prospecting prompt guidance; defaults to config/prospecting_prompt.md.")
     parser.add_argument("--industry", help="Industry playbook name, e.g. marketing_adtech, ai_video_creative, ecommerce, gaming, enterprise_llm.")
+    parser.add_argument("--workload", help="Explicit active workload, e.g. video_generation, image_generation, llm_platform, model_api.")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv)
     if not any(getattr(args, field, None) for field in ("event_id", "customer", "domain", "email", "window", "contact", "company")):
@@ -338,6 +345,40 @@ VERTICAL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "game trailer",
         "in-game content",
     ),
+    "media_entertainment": (
+        "media and entertainment",
+        "broadcasting",
+        "streaming",
+        "production",
+        "content distribution",
+        "news",
+        "format licensing",
+        "studio",
+        "broadcasters",
+        "streamers",
+    ),
+    "consumer_technology": (
+        "consumer devices",
+        "global technology company",
+        "iphone",
+        "mac",
+        "ipad",
+        "app store",
+        "software services",
+    ),
+    "enterprise_software": (
+        "enterprise software",
+        "saas",
+        "developer tools",
+        "api platform",
+        "cloud software",
+    ),
+}
+
+VERTICAL_DISPLAY_NAMES = {
+    "media_entertainment": "Media / Entertainment / Content",
+    "consumer_technology": "Consumer Technology",
+    "enterprise_software": "Enterprise Software / SaaS",
 }
 
 
@@ -381,7 +422,7 @@ def infer_vertical(context: PrepContext, explicit_industry: str | None = None) -
     playbook = load_industry_playbook(best)
     return {
         "name": best,
-        "display_name": playbook["display_name"],
+        "display_name": VERTICAL_DISPLAY_NAMES.get(best) or playbook["display_name"],
         "confidence": confidence,
         "evidence": [f"Matched signal: {item}" for item in sorted(set(matches))[:5]],
     }
@@ -422,10 +463,129 @@ def question_item(section: str, question: str, answer: str, confidence: str, ask
     }
 
 
-def build_question_prefill(context: PrepContext, vertical: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+WORKLOAD_SPECIFIC_INDUSTRIES = {"ai_video_creative"}
+BROAD_VERTICAL_INDUSTRIES = {"marketing_adtech", "ecommerce", "gaming", "enterprise_llm", "default"}
+
+VERTICAL_SUBTYPE_TEMPLATES: dict[str, dict[str, str]] = {
+    "agency_marketing_services": {
+        "display_name": "Marketing / AdTech / Agency Holding Company",
+        "target_users": "global brands, advertisers, enterprise marketing teams, media buyers, and agency clients",
+        "business_model": "advertising, marketing services, media planning/buying, creative services, communications, data/technology-enabled marketing, and agency network services",
+    },
+    "intent_marketing_comparison": {
+        "display_name": "Marketing / AdTech / Intent Marketing or Comparison Platform",
+        "target_users": "high-intent consumers, brand/advertiser partners, and publishers",
+        "business_model": "lead generation, affiliate/referral, comparison content, performance marketing, and brand partnerships",
+    },
+    "media_entertainment_content": {
+        "display_name": "Media / Entertainment / Content",
+        "target_users": "TV/streaming audiences, broadcasters/streamers, production partners, content buyers, and media partners",
+        "business_model": "broadcasting, streaming, content production, format licensing/global distribution, and media partnerships",
+    },
+    "consumer_technology": {
+        "display_name": "Consumer Technology",
+        "target_users": "consumers, developers, enterprise customers, creative professionals, and ecosystem partners",
+        "business_model": "hardware sales, software/services revenue, app ecosystem, subscriptions, accessories, and support",
+    },
+    "creative_platform": {
+        "display_name": "Creative Platform / AI Video Creative",
+        "target_users": "creators, designers, marketers, agencies, enterprise creative teams, and API developers",
+        "business_model": "subscriptions, credits, asset licensing, API usage, enterprise/team plans, and creative tools",
+    },
+}
+
+
+def infer_vertical_subtype(text: str, vertical_name: str | None = None, explicit_industry: str | None = None) -> dict[str, str]:
+    lowered = (text or "").lower()
+    explicit = industry_slug(explicit_industry or "")
+    if explicit == "ai_video_creative":
+        return {"name": "creative_platform", **VERTICAL_SUBTYPE_TEMPLATES["creative_platform"], "confidence": "confirmed"}
+    if explicit == "marketing_adtech" or vertical_name == "marketing_adtech":
+        if any(term in lowered for term in ("intent marketing", "comparison platform", "comparison platforms", "lead generation", "affiliate", "referral", "purchase decisions", "customer acquisition platform", "performance marketing platform")):
+            return {"name": "intent_marketing_comparison", **VERTICAL_SUBTYPE_TEMPLATES["intent_marketing_comparison"], "confidence": "likely"}
+        if any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing", "creative services", "communications agency", "advertising and marketing")):
+            return {"name": "agency_marketing_services", **VERTICAL_SUBTYPE_TEMPLATES["agency_marketing_services"], "confidence": "likely"}
+        return {"name": "unknown", "display_name": "Unknown", "target_users": "", "business_model": "", "confidence": "unknown"}
+    if any(term in lowered for term in ("media and entertainment", "broadcasting", "streaming service", "tv channel", "news company", "content distribution", "format licensing", "global distribution", "production arm", "content buyers", "broadcasters", "streamers")):
+        return {"name": "media_entertainment_content", **VERTICAL_SUBTYPE_TEMPLATES["media_entertainment_content"], "confidence": "likely"}
+    if any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv", "consumer devices", "app store ecosystem")):
+        return {"name": "consumer_technology", **VERTICAL_SUBTYPE_TEMPLATES["consumer_technology"], "confidence": "likely"}
+    if any(term in lowered for term in ("creative platform", "stock assets", "templates", "design assets", "design platform", "ai-enabled image", "ai image", "ai video", "image generation", "video generation")):
+        return {"name": "creative_platform", **VERTICAL_SUBTYPE_TEMPLATES["creative_platform"], "confidence": "likely"}
+    if any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing", "creative services", "communications agency")):
+        return {"name": "agency_marketing_services", **VERTICAL_SUBTYPE_TEMPLATES["agency_marketing_services"], "confidence": "likely"}
+    if any(term in lowered for term in ("intent marketing", "comparison platform", "comparison platforms", "lead generation", "affiliate", "referral", "purchase decisions", "customer acquisition platform", "performance marketing platform")):
+        return {"name": "intent_marketing_comparison", **VERTICAL_SUBTYPE_TEMPLATES["intent_marketing_comparison"], "confidence": "likely"}
+    if vertical_name == "ai_video_creative":
+        return {"name": "creative_platform", **VERTICAL_SUBTYPE_TEMPLATES["creative_platform"], "confidence": "weak"}
+    return {"name": "unknown", "display_name": "Unknown", "target_users": "", "business_model": "", "confidence": "unknown"}
+
+
+def incompatible_field_reason(text: str, subtype: str, weak_identity_case: bool = False) -> str | None:
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+    if weak_identity_case and any(term in lowered for term in ("consumers", "advertisers", "broadcasting", "hardware sales", "subscriptions", "comparison", "agency network")):
+        return "weak_identity_company_template_blocked"
+    blocked: dict[str, tuple[str, ...]] = {
+        "agency_marketing_services": ("intent-marketing", "intent marketing", "comparison-platform", "comparison platform", "high-intent consumers", "consumer devices", "hardware sales", "broadcasting", "streaming", "format licensing"),
+        "intent_marketing_comparison": ("consumer devices", "hardware sales", "app store", "accessories", "ecosystem partners", "developers, enterprise", "creative professionals", "agency network", "agency networks", "broadcasting", "streaming", "format licensing", "content production"),
+        "media_entertainment_content": ("intent-marketing", "intent marketing", "comparison-platform", "comparison platform", "high-intent consumers", "hardware sales", "app store", "agency network", "media planning/buying"),
+        "consumer_technology": ("intent-marketing", "intent marketing", "comparison-platform", "comparison platform", "high-intent consumers", "agency network", "media planning/buying", "broadcasting", "format licensing", "creative-platform packaging"),
+        "creative_platform": ("hardware sales", "app store", "accessories", "intent-marketing", "intent marketing", "comparison-platform", "comparison platform", "broadcasting", "format licensing", "agency network services"),
+    }
+    for term in blocked.get(subtype, ()):
+        if term in lowered:
+            return f"incompatible_with_{subtype}"
+    return None
+
+
+def compatibility_fallback(field: str) -> str:
+    if field == "target_users":
+        return "target users/customer segments are not confirmed from compatible current-customer evidence"
+    if field == "business_model":
+        return "business model/revenue model is not confirmed from compatible current-customer evidence"
+    if field == "what_they_do":
+        return "To Validate: business description could not be confirmed from compatible current-customer evidence."
+    return "To Validate"
+
+
+def infer_confidence_layers(context: PrepContext, vertical: dict[str, Any], explicit_workload: str | None = None) -> dict[str, str]:
+    identity = "confirmed_company" if context.customer.domain or context.customer.company_name else ("weak_person_only" if context.customer.canonical_name else "unknown")
+    company_vertical = vertical.get("confidence") or "unknown"
+    enrichment = context.enrichment or {}
+    use_cases = [str(item).lower() for item in enrichment.get("known_use_cases") or []]
+    explicit = (explicit_workload or "").strip().lower()
+    workload = "unknown"
+    if explicit:
+        workload = "confirmed"
+    elif vertical.get("name") in WORKLOAD_SPECIFIC_INDUSTRIES and vertical.get("confidence") == "confirmed":
+        workload = "likely"
+    elif any(
+        any(signal in item for signal in ("image generation", "video generation", "voice", "audio", "model api", "inference", "api or enterprise", "llm", "chatbot", "agent", "ocr"))
+        for item in use_cases
+    ):
+        workload = "likely"
+    product_fit = "possible_after_validation"
+    if workload in {"likely", "confirmed"} and (enrichment.get("possible_byteplus_fit") or vertical.get("name") in WORKLOAD_SPECIFIC_INDUSTRIES):
+        product_fit = "likely"
+    return {
+        "identity_confidence": identity,
+        "company_vertical_confidence": company_vertical if company_vertical in {"unknown", "weak", "likely", "confirmed"} else "unknown",
+        "active_workload_confidence": workload,
+        "product_fit_confidence": product_fit,
+    }
+
+
+def workload_is_active(confidence_layers: dict[str, str]) -> bool:
+    return confidence_layers.get("active_workload_confidence") in {"likely", "confirmed"}
+
+
+def build_question_prefill(context: PrepContext, vertical: dict[str, Any], confidence_layers: dict[str, str] | None = None) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     enrichment = context.enrichment or {}
     known = context.known or {}
     name = vertical.get("name") or "default"
+    active_workload = workload_is_active(confidence_layers or {})
     source = first_source_label(context)
     evidence = [source] if source else []
     company_desc = enrichment.get("description") or "customer/company context"
@@ -461,7 +621,28 @@ def build_question_prefill(context: PrepContext, vertical: dict[str, Any]) -> tu
         ),
     ]
 
-    if name == "marketing_adtech":
+    if name == "marketing_adtech" and not active_workload:
+        vertical_items = [
+            question_item(
+                "Standard Discovery Questions",
+                "Are you currently focusing more on growth, monetization, or retention?",
+                "To Validate: confirm whether the meeting is about growth, monetization, retention, media optimization, workflow automation, model/API infrastructure, or another use case.",
+                "to_validate",
+                "Which business priority should this discussion focus on: growth, monetization, operational efficiency, customer insights, creative production, or AI infrastructure?",
+                "Uses the company vertical for discovery without assuming an active AI workload.",
+                evidence,
+            ),
+            question_item(
+                "AI Usage & Current Stack",
+                "Current AI adoption?",
+                "To Validate: active AI or BytePlus-relevant workload is not confirmed.",
+                "to_validate",
+                "Are you exploring AI for creative production, media optimization, customer insights, workflow automation, model/API infrastructure, or another use case?",
+                "Separates company vertical from actual workload and product fit.",
+            ),
+        ]
+        omitted = ["Product-specific image/video, model-stack, generation-volume, and cross-sell questions collapsed until workload evidence appears."]
+    elif name == "marketing_adtech":
         vertical_items = [
             question_item(
                 "Standard Discovery Questions",
@@ -523,12 +704,23 @@ def build_question_prefill(context: PrepContext, vertical: dict[str, Any]) -> tu
             question_item("Switching Mechanism", "What would make you switch providers?", "To Validate: switching trigger is not confirmed.", "to_validate", "Would you switch for quality, latency, cost, compliance, routing, or operational control?", "Turns discovery into competitive positioning."),
         ]
         omitted = ["Image/video questions collapsed unless multimodal evidence appears.", "Gaming/adtech questions omitted."]
+    elif name == "ecommerce" and not active_workload:
+        vertical_items = [
+            question_item("Standard Discovery Questions", "Core ecommerce/product scope?", "To Validate: confirm the product line, region, user/customer segment, and active AI workload.", "to_validate", "Which team or product line is this discussion for, and what active AI or BytePlus-relevant workload should we focus on?", "Keeps ecommerce discovery broad until workload is confirmed."),
+            question_item("AI Usage & Current Stack", "Current AI adoption?", "To Validate: no confirmed recommendation, chatbot, catalog automation, creative, or model/API workload found.", "to_validate", "Are you exploring AI for catalog/content automation, search/recommendation, support, creative production, model/API infrastructure, or another use case?", "Avoids assuming ecommerce-specific AI workloads from industry alone."),
+        ]
+        omitted = ["Recommendation/search/ranking, product image, chatbot, and livestream questions collapsed until workload evidence appears."]
     elif name == "ecommerce":
         vertical_items = [
             question_item("Standard Discovery Questions", "Catalog / SKU scale?", "Not Found.", "not_found", "How many SKUs/listings and regions/languages need AI support?", "Sizes catalog automation opportunity."),
             question_item("Business Scenarios & Use Cases", "Recommendation/search/ranking or product content?", "Likely: ecommerce teams often evaluate listing content, product images, recommendations/search, reviews, and support. (?)", "likely", "Which workflow has the clearest ROI: listings, product images, search/recommendation, reviews, or support?", "Maps workload to Ark/Seedream/LLM fit."),
         ]
         omitted = ["Long-form video questions collapsed unless livestream evidence appears.", "Private deployment omitted unless security evidence appears."]
+    elif name == "gaming" and not active_workload:
+        vertical_items = [
+            question_item("Business Scenarios & Use Cases", "Game/company scope?", "To Validate: genre, product line, team scope, and active AI workload are not confirmed.", "to_validate", "Which team or product line is this discussion for, and are you exploring AI for assets, NPC/agents, localization, support, marketing, infrastructure, or another use case?", "Keeps gaming discovery broad until workload is confirmed."),
+        ]
+        omitted = ["NPC, level-design, asset-generation, and game-video questions collapsed until workload evidence appears."]
     elif name == "gaming":
         vertical_items = [
             question_item("Business Scenarios & Use Cases", "Game genre and production stage?", "To Validate: genre, stage, and active AI workflow are not confirmed.", "to_validate", "Is the priority assets, NPC/agent, localization, support, or marketing creative?", "Determines whether Seedream, Seedance, LLM/agents, or Ark should lead."),
@@ -1192,10 +1384,11 @@ def company_domain_aliases(company_name: str | None) -> list[str]:
     if not company_name:
         return []
     compact_company = re.sub(r"[^a-z0-9]+", "", company_name.lower())
+    parts = [part for part in re.split(r"[^a-z0-9]+", company_name.lower()) if part]
     aliases = [compact_company]
-    if compact_company == "naturalintelligence":
-        aliases.append("naturalint")
-    return aliases
+    if len(parts) >= 2 and len(parts[1]) >= 3:
+        aliases.append(parts[0] + parts[1][:3])
+    return list(dict.fromkeys(aliases))
 
 
 def likely_official_web_result(result: dict[str, str], company_name: str | None) -> bool:
@@ -1209,11 +1402,8 @@ def likely_official_web_result(result: dict[str, str], company_name: str | None)
 
 def verified_related_domain(host: str, company_name: str | None) -> bool:
     normalized = host.lower().removeprefix("www.")
-    compact_company = re.sub(r"[^a-z0-9]+", "", (company_name or "").lower())
-    if compact_company == "freepik":
-        allowed = ("freepik.es", "freepik.com", "support.freepik.com", "magnific.com")
-        return normalized == allowed or any(normalized.endswith("." + domain) or normalized == domain for domain in allowed)
-    return False
+    configured = [item.strip().lower().removeprefix("www.") for item in os.getenv("PREP_OFFICIAL_RELATED_DOMAINS", "").split(",") if item.strip()]
+    return any(normalized == domain or normalized.endswith("." + domain) for domain in configured)
 
 
 def confirmed_domain_match(url_or_host: str, confirmed_domain: str | None = None) -> bool:
@@ -1534,16 +1724,15 @@ def normalize_company_overview(text: str, company_name: str | None = None) -> st
     company = company_name or "The company"
     if contains_placeholder(compact):
         return ""
-    is_apple = company.lower() == "apple" or "apple.com" in lowered
-    if is_apple and any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv", "vision")):
+    if any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv", "consumer devices")):
         if overview_quality_issue(compact, company_name):
-            return "Apple is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across products such as iPhone, Mac, iPad, Apple Watch, Vision, AirPods, and Apple TV."
+            return f"{company} is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across major product and ecosystem categories."
         return compact
     compact_company = re.sub(r"[^a-z0-9]+", "", company.lower())
-    if compact_company in {"interpublicgroupipg", "interpublicgroup", "ipg"} or any(term in lowered for term in ("global advertising", "marketing services", "agency networks", "agency network", "media buying", "brand marketing", "mccann", "fcb", "ipg mediabrands")):
-        return "Interpublic Group (IPG) is a global advertising and marketing services holding company with agency networks across creative, media, data, technology, communications, and brand marketing services."
-    if "keshet" in compact_company or any(term in lowered for term in ("keshet broadcasting", "keshet 12", "streaming service", "content distribution", "international content", "media company")):
-        return "Keshet Media Group is a media and entertainment company with broadcasting, streaming, production, news, and international content distribution businesses."
+    if any(term in lowered for term in ("global advertising", "marketing services", "agency networks", "agency network", "media buying", "brand marketing")):
+        return f"{company} is an advertising and marketing services company with capabilities across creative, media, data, technology, communications, and brand marketing services."
+    if any(term in lowered for term in ("media and entertainment", "broadcasting", "streaming service", "content distribution", "international content", "media company", "format licensing", "global distribution and production")):
+        return f"{company} is a media and entertainment company with broadcasting, streaming, production, news, and international content distribution businesses."
     if any(term in lowered for term in ("intent marketing", "comparison platform", "customer acquisition")):
         return f"{company} is an intent-marketing and customer-acquisition company focused on connecting consumers with brands through comparison and performance marketing platforms."
     if any(term in lowered for term in ("creative platform", "stock assets", "templates", "image generation", "video generation", "design platform")):
@@ -1733,7 +1922,7 @@ def extract_company_dossier(
         ("Background remover", ("background remover", "bg remover")),
         ("Upscaler", ("upscaler", "upscale")),
         ("Custom models", ("custom model", "custom models")),
-        ("API / enterprise plans", ("api", "developer api", "enterprise plan", "enterprise plans")),
+        ("API / enterprise plans", ("model api", "inference api", "creative api", "api deployment", "api integration", "enterprise plan", "enterprise plans")),
     ]
     lowered = combined.lower()
     for label, needles in module_signals:
@@ -1820,19 +2009,16 @@ def extract_company_dossier(
     founded_match = re.search(r"(?:est\.?|founded|operating since)\s*(?:in)?\s*(20\d{2}|19\d{2})", combined, re.IGNORECASE)
     if founded_match:
         founded_year = founded_match.group(1)
-    creative_signal = any(term in lowered for term in ("image generation", "video generation", "generative ai", "creative platform", "creator", "designers", "ai image", "ai video"))
-    marketing_signal = any(term in lowered for term in ("intent marketing", "customer acquisition", "comparison platform", "high-intent consumers"))
+    vertical_subtype = infer_vertical_subtype(combined, None, None)
+    subtype_name = vertical_subtype.get("name", "unknown")
+    creative_signal = subtype_name == "creative_platform" or any(term in lowered for term in ("image generation", "video generation", "generative ai", "creative platform", "creator", "designers", "ai image", "ai video"))
+    intent_marketing_signal = subtype_name == "intent_marketing_comparison"
+    agency_signal = subtype_name == "agency_marketing_services"
+    media_signal = subtype_name == "media_entertainment_content"
+    consumer_tech_signal = subtype_name == "consumer_technology"
     target_users = ""
-    if marketing_signal or any(term in lowered for term in ("high-intent consumers", "top-tier brands", "advertisers", "publishers")):
-        target_users = "high-intent consumers, brand/advertiser partners, and publishers"
-    elif any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing", "creative services", "communications")):
-        target_users = "global brands, advertisers, enterprise marketing teams, media buyers, and agency clients"
-    elif any(term in lowered for term in ("media and entertainment", "media company", "broadcasting", "broadcasters", "tv channel", "news company", "streaming service", "streamers", "streaming platforms", "content buyers", "international distributors", "format licensing", "global distribution", "content distribution", "production partners")):
-        target_users = "TV/streaming audiences, broadcasters/streamers, production partners, content buyers, and media partners"
-    elif any(term in lowered for term in ("consumer devices", "iphone", "mac", "ipad", "apple watch", "app store", "developers", "enterprise customers")):
-        target_users = "consumers, developers, enterprise customers, creative professionals, and ecosystem partners"
-    elif creative_signal:
-        target_users = "creators, designers, marketers, agencies, enterprise creative teams, and API developers"
+    if subtype_name in VERTICAL_SUBTYPE_TEMPLATES:
+        target_users = VERTICAL_SUBTYPE_TEMPLATES[subtype_name]["target_users"]
     traffic_source_scale = ""
     traffic_terms = []
     for term in ("seo", "sem", "affiliate", "paid social", "partner traffic", "high-intent audiences", "purchase decisions"):
@@ -1841,16 +2027,8 @@ def extract_company_dossier(
     if traffic_terms:
         traffic_source_scale = "; ".join(dict.fromkeys(traffic_terms))
     business_model = ""
-    if marketing_signal or any(term in lowered for term in ("publishers monetize",)):
-        business_model = "intent-marketing / comparison-platform model connecting consumers, publishers, and brands"
-    elif any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing", "creative services", "communications")):
-        business_model = "advertising, marketing services, media planning/buying, creative services, data/technology-enabled marketing, communications, and agency network services"
-    elif any(term in lowered for term in ("media and entertainment", "media company", "broadcasting", "tv channel", "news company", "streaming service", "format licensing", "global distribution", "content distribution", "content production", "production arm", "media partnerships", "broadcasters", "streamers", "content buyers")):
-        business_model = "broadcasting, streaming, content production, format licensing/global distribution, and media partnerships"
-    elif any(term in lowered for term in ("consumer devices", "iphone", "mac", "ipad", "apple watch", "app store", "subscriptions", "accessories")):
-        business_model = "hardware sales, software/services revenue, App Store ecosystem, subscriptions, accessories, and support"
-    elif creative_signal and any(term in lowered for term in ("subscription", "credits", "api", "enterprise", "paid subscribers", "pricing")):
-        business_model = "subscription, credit, API, and enterprise creative-platform packaging"
+    if subtype_name in VERTICAL_SUBTYPE_TEMPLATES:
+        business_model = VERTICAL_SUBTYPE_TEMPLATES[subtype_name]["business_model"]
     social_content_presence = ""
     if any(term in lowered for term in ("paid media", "ad creative", "landing page", "creative testing", "paid social")):
         social_content_presence = "paid media / landing-page creative workflow signal found"
@@ -1909,6 +2087,7 @@ def extract_company_dossier(
         "target_users": target_users,
         "traffic_source_scale": traffic_source_scale,
         "business_model": business_model,
+        "vertical_subtype": vertical_subtype,
         "social_content_presence": social_content_presence,
         "candidate_company": candidate_company,
         "source_evidence": sorted(
@@ -1941,7 +2120,7 @@ def infer_use_cases(text: str) -> list[str]:
         (("image", "ai art", "text-to-image", "background remover", "upscaler"), "image generation and creative asset editing"),
         (("video", "shorts", "text-to-video", "ai video"), "video generation / short-form creative workflow"),
         (("voice", "audio", "tts", "text to speech"), "voice or audio generation workflow"),
-        (("developer api", "api integration", " api ", "custom model", "enterprise integration"), "API or enterprise integration requirements"),
+        (("model api", "inference api", "creative api", "api deployment", "api integration", "custom model", "enterprise integration"), "API or enterprise integration requirements"),
     ]
     for needles, label in signals:
         if any(needle in lowered for needle in needles) and label not in use_cases:
@@ -2339,6 +2518,8 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
     event = context.event or {}
     customer = context.customer
     enrichment = normalize_enrichment(context.enrichment, context)
+    run_id = uuid.uuid4().hex
+    customer_key = re.sub(r"[^a-z0-9]+", "-", (customer.company_name or enrichment.get("company_name") or customer.canonical_name or customer.domain or "unknown").lower()).strip("-")
     attendees = []
     for attendee in event.get("attendees") or []:
         email = attendee.get("third_party_email") or attendee.get("email") or ""
@@ -2392,8 +2573,40 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
             "web_search": context.web_search_status,
             "company_overview_enrichment": context.company_overview_status,
         },
+        "run_id": run_id,
+        "customer_key": customer_key,
     }
     dossier = enrichment.get("dossier") or {}
+    registry = build_evidence_registry(dossier, run_id, customer_key, customer.company_name or enrichment.get("company_name") or customer.canonical_name, customer.domain)
+    if not registry and dossier.get("what_they_do") and not str(dossier.get("what_they_do")).startswith("To Validate:"):
+        source_url = ""
+        for item in enrichment.get("source_links") or []:
+            source_url = item.get("url") or item.get("label") or ""
+            if source_url:
+                break
+        source_url = source_url or (f"https://{customer.domain}" if customer.domain else "")
+        if source_url:
+            registry = build_evidence_registry(
+                {
+                    "source_evidence": [
+                        {
+                            "claim": dossier["what_they_do"],
+                            "url": source_url,
+                            "tier": source_tier(source_url, customer.company_name or enrichment.get("company_name") or customer.canonical_name, customer.domain)[0],
+                            "tier_label": source_tier(source_url, customer.company_name or enrichment.get("company_name") or customer.canonical_name, customer.domain)[1],
+                            "source_classification": "customer_evidence",
+                        }
+                    ]
+                },
+                run_id,
+                customer_key,
+                customer.company_name or enrichment.get("company_name") or customer.canonical_name,
+                customer.domain,
+            )
+    render_json["evidence_registry"] = registry
+    if registry:
+        dossier["source_evidence"] = registry
+        render_json["enrichment"]["dossier"] = dossier
     has_official_overview_claim = any(
         item.get("source_classification") == "customer_evidence"
         and "Tier 1 - official company site" in str(item.get("tier_label") or "")
@@ -2419,8 +2632,13 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
         prompt = load_prospecting_prompt(getattr(args, "prospecting_prompt", None), debug=getattr(args, "debug", False))
         vertical = infer_vertical(context, getattr(args, "industry", None))
         playbook = load_industry_playbook(vertical.get("name"), debug=getattr(args, "debug", False))
-        questions, omitted, readiness = build_question_prefill(context, vertical)
+        confidence_layers = infer_confidence_layers(context, vertical, getattr(args, "workload", None))
         render_json["vertical"] = vertical
+        render_json["confidence_layers"] = confidence_layers
+        apply_production_field_guards(render_json, getattr(args, "industry", None) if not getattr(args, "workload", None) else getattr(args, "workload", None))
+        questions, omitted, readiness = build_question_prefill(context, vertical, confidence_layers)
+        if getattr(args, "workload", None):
+            render_json["explicit_workload"] = args.workload
         render_json["prospecting"] = {
             "prompt_path": prompt.get("path", ""),
             "prompt_available": prompt.get("available") == "true",
@@ -2430,7 +2648,167 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
             "meeting_readiness_assets": readiness,
         }
         render_json["question_prefill"] = questions
+    else:
+        vertical = infer_vertical(context, None)
+        render_json["vertical"] = vertical
+        render_json["confidence_layers"] = infer_confidence_layers(context, vertical, None)
+        apply_production_field_guards(render_json, None)
     return render_json
+
+
+def claim_type_for_source(item: dict[str, Any]) -> str:
+    claim = str(item.get("claim") or "").lower()
+    url = str(item.get("url") or "")
+    purpose = source_purpose(url, "", claim)
+    if purpose == "pricing":
+        return "pricing_packaging"
+    if purpose in {"developer_docs", "support"}:
+        return "active_workload"
+    if any(term in claim for term in ("revenue", "employees", "users", "downloads", "paid subscribers", "enterprise customers", "purchase decisions")):
+        return "scale_signal"
+    if any(term in claim for term in ("founded", "based in", "headquartered", "located in")):
+        return "hq_location"
+    return "company_overview"
+
+
+def build_evidence_registry(dossier: dict[str, Any], run_id: str, customer_key: str, company_name: str | None, domain: str | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in dossier.get("source_evidence") or []:
+        claim = normalize_company_overview(str(item.get("claim") or ""), company_name) or str(item.get("claim") or "").strip()
+        if not claim or contains_placeholder(claim):
+            continue
+        claim_type = claim_type_for_source(item)
+        key = (claim_type, re.sub(r"\s+", " ", claim).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        url = str(item.get("url") or "")
+        tier = item.get("tier")
+        tier_label = item.get("tier_label") or source_tier(url, company_name, domain)[1]
+        source_purpose_value = source_purpose(url, "", claim)
+        row = {
+            **item,
+            "claim_id": f"{customer_key}-{len(rows)+1:03d}",
+            "claim_type": claim_type,
+            "claim_text": claim,
+            "claim": claim,
+            "source_url": url,
+            "source_tier": tier if tier is not None else source_tier(url, company_name, domain)[0],
+            "source_purpose": source_purpose_value,
+            "confidence": "known" if "Tier 1" in str(tier_label) and claim_type == "company_overview" else "likely",
+            "run_id": run_id,
+            "customer_key": customer_key,
+        }
+        rows.append(row)
+    rows.sort(key=lambda item: (0 if item.get("claim_type") == "company_overview" else 1, item.get("source_tier", 9)))
+    return rows[:8]
+
+
+def field_starts_unavailable(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return not text or text.startswith(("to validate", "not found"))
+
+
+def apply_production_field_guards(render_json: dict[str, Any], explicit_industry: str | None = None) -> list[str]:
+    warnings: list[str] = []
+    customer = render_json.get("customer") or {}
+    enrichment = render_json.get("enrichment") or {}
+    dossier = enrichment.setdefault("dossier", {})
+    vertical = render_json.get("vertical") or {}
+    context_class = (render_json.get("customer_context") or {}).get("classification")
+    weak_identity_case = context_class in {"person_only", "unknown"} and not customer.get("domain")
+    current_text = " ".join(
+        str(part or "")
+        for part in [
+            dossier.get("what_they_do"),
+            dossier.get("target_users"),
+            dossier.get("business_model"),
+            customer.get("description"),
+            " ".join(str(item) for item in enrichment.get("known_use_cases") or []),
+            " ".join(vertical.get("evidence") or []),
+        ]
+    )
+    subtype = dossier.get("vertical_subtype") or infer_vertical_subtype(current_text, vertical.get("name"), explicit_industry)
+    allowed_by_vertical = {
+        "marketing_adtech": {"agency_marketing_services", "intent_marketing_comparison", "unknown"},
+        "ai_video_creative": {"creative_platform", "unknown"},
+    }
+    allowed_subtypes = allowed_by_vertical.get(vertical.get("name"))
+    if allowed_subtypes and subtype.get("name") not in allowed_subtypes:
+        subtype = infer_vertical_subtype(current_text, vertical.get("name"), explicit_industry)
+    if subtype.get("name") == "unknown" and vertical.get("name") == "ai_video_creative":
+        subtype = infer_vertical_subtype("", vertical.get("name"), "ai_video_creative")
+    dossier["vertical_subtype"] = subtype
+    vertical["subtype"] = subtype
+    render_json["vertical"] = vertical
+
+    if weak_identity_case:
+        for field in ("target_users", "business_model"):
+            if dossier.get(field):
+                dossier[field] = compatibility_fallback(field)
+                warnings.append(f"downgraded_{field}_weak_identity")
+        if dossier.get("what_they_do") and not str(dossier.get("what_they_do")).lower().startswith("to validate"):
+            dossier["what_they_do"] = compatibility_fallback("what_they_do")
+            warnings.append("downgraded_company_overview_weak_identity")
+    else:
+        subtype_name = subtype.get("name", "unknown")
+        for field in ("what_they_do", "target_users", "business_model"):
+            field_text = str(dossier.get(field) or "")
+            reason = incompatible_field_reason(field_text, subtype_name, False)
+            if not reason and vertical.get("name") == "marketing_adtech" and any(term in field_text.lower() for term in ("consumer devices", "hardware sales", "app store", "accessories", "broadcasting", "streaming", "format licensing")):
+                reason = "incompatible_with_marketing_adtech"
+            if not reason and vertical.get("name") == "ai_video_creative" and any(term in field_text.lower() for term in ("hardware sales", "app store", "intent-marketing", "comparison-platform", "broadcasting", "format licensing")):
+                reason = "incompatible_with_ai_video_creative"
+            if reason:
+                dossier[field] = compatibility_fallback(field)
+                warnings.append(f"downgraded_incompatible_{field}")
+
+        if (
+            vertical.get("name") == "ai_video_creative"
+            and customer.get("domain")
+            and field_starts_unavailable(dossier.get("what_they_do"))
+        ):
+            company = customer.get("company_name") or dossier.get("company") or customer.get("name") or "The company"
+            dossier["what_they_do"] = f"{company} appears to be a creative platform for design assets and AI-enabled image/video workflows."
+            dossier["what_they_do_confidence"] = "likely"
+            subtype = infer_vertical_subtype("", vertical.get("name"), "ai_video_creative")
+            dossier["vertical_subtype"] = subtype
+            vertical["subtype"] = subtype
+            render_json["vertical"] = vertical
+            warnings.append("used_explicit_workload_vertical_overview_fallback")
+
+        subtype_name = (dossier.get("vertical_subtype") or {}).get("name", "unknown")
+        if subtype_name in VERTICAL_SUBTYPE_TEMPLATES:
+            template = VERTICAL_SUBTYPE_TEMPLATES[subtype_name]
+            if not dossier.get("target_users") or str(dossier.get("target_users")).startswith("target users/customer segments are not confirmed") or incompatible_field_reason(str(dossier.get("target_users")), subtype_name):
+                dossier["target_users"] = template["target_users"]
+                warnings.append("filled_target_users_from_current_subtype")
+            if not dossier.get("business_model") or str(dossier.get("business_model")).startswith("business model/revenue model is not confirmed") or incompatible_field_reason(str(dossier.get("business_model")), subtype_name):
+                dossier["business_model"] = template["business_model"]
+                warnings.append("filled_business_model_from_current_subtype")
+
+    filtered_registry: list[dict[str, Any]] = []
+    subtype_name = (dossier.get("vertical_subtype") or {}).get("name", "unknown")
+    for row in render_json.get("evidence_registry") or []:
+        claim = str(row.get("claim_text") or row.get("claim") or "")
+        if row.get("claim_type") == "company_overview" and incompatible_field_reason(claim, subtype_name, weak_identity_case):
+            warnings.append("removed_incompatible_evidence_row")
+            continue
+        filtered_registry.append(row)
+    render_json["evidence_registry"] = filtered_registry
+    if filtered_registry:
+        dossier["source_evidence"] = filtered_registry
+    elif dossier.get("source_evidence"):
+        dossier["source_evidence"] = []
+    enrichment["dossier"] = dossier
+    render_json["enrichment"] = enrichment
+    if warnings:
+        existing = str((render_json.get("source_status") or {}).get("field_validation") or "")
+        all_warnings = [existing] if existing else []
+        all_warnings.extend(warnings)
+        render_json.setdefault("source_status", {})["field_validation"] = "; ".join(dict.fromkeys(all_warnings))
+    return warnings
 
 
 def normalize_enrichment(enrichment: dict[str, Any] | None, context: PrepContext) -> dict[str, Any]:
@@ -2491,6 +2869,44 @@ def write_local_outputs(render_json: dict[str, Any], markdown: str, title: str) 
     return json_path, md_path
 
 
+def validate_rendered_output(render_json: dict[str, Any], markdown: str) -> list[str]:
+    warnings: list[str] = []
+    forbidden = ["Official company overview", "Generic company overview", "Normalized overview", "Overview unavailable", "To Validate: To Validate", "Known: Known:"]
+    for item in forbidden:
+        if item in markdown:
+            warnings.append(f"output_validation: forbidden text found: {item}")
+    layers = render_json.get("confidence_layers") or {}
+    if layers.get("active_workload_confidence") in {"unknown", "weak"}:
+        if re.search(r"Likely: (Seedance|Seedream|Ark|AI image|AI video|API / enterprise)", markdown):
+            warnings.append("output_validation: likely product/workload text found while active workload is not confirmed")
+    subtype = ((render_json.get("enrichment") or {}).get("dossier") or {}).get("vertical_subtype") or (render_json.get("vertical") or {}).get("subtype") or {}
+    subtype_name = subtype.get("name") if isinstance(subtype, dict) else ""
+    context_class = (render_json.get("customer_context") or {}).get("classification")
+    weak_identity_case = context_class in {"person_only", "unknown"} and not (render_json.get("customer") or {}).get("domain")
+    if subtype_name:
+        for label in ("Target Users / Customer Segments", "Business Model / Revenue Model", "What They Do"):
+            for match in re.findall(rf"\| {re.escape(label)} \| ([^\n]+)", markdown):
+                field_value = match.split(" Follow-up:", 1)[0]
+                if incompatible_field_reason(field_value, subtype_name, weak_identity_case):
+                    warnings.append(f"field_validation: downgraded_incompatible_{label.lower().replace(' / ', '_').replace(' ', '_')}")
+                    break
+    def normalize_url_for_validation(value: str) -> str:
+        return value.strip().rstrip(".,;)")
+
+    registry_urls = {
+        normalize_url_for_validation(str(item.get("source_url") or item.get("url") or ""))
+        for item in render_json.get("evidence_registry") or []
+    }
+    cited_urls = {
+        normalize_url_for_validation(url)
+        for url in re.findall(r"Evidence: (https?://[^\s|,]+)", markdown)
+    }
+    missing = {url for url in cited_urls if url and url not in registry_urls}
+    if missing:
+        warnings.append("output_validation: cited evidence URL missing from registry: " + ", ".join(sorted(missing)[:3]))
+    return warnings
+
+
 def lark_markdown_arg(path: Path) -> str:
     try:
         relative = path.resolve().relative_to(Path.cwd().resolve())
@@ -2508,7 +2924,9 @@ def create_or_update_doc(
     debug: bool = False,
 ) -> tuple[str | None, str]:
     if args.dry_run:
-        return None, "dry-run: no Lark write"
+        return None, "Lark doc creation skipped because --dry-run was used"
+    if getattr(args, "no_create_doc", False):
+        return None, "Lark doc creation skipped because --no-create-doc was used"
     fallback_written = markdown_path.exists() and markdown_path.stat().st_size > 0
     markdown_arg = lark_markdown_arg(markdown_path)
     if args.update_existing and existing_doc and existing_doc.get("url"):
@@ -2564,6 +2982,26 @@ def create_or_update_doc(
         f"Fallback markdown written successfully: {'yes' if fallback_written else 'no'}",
     ]
     return None, "\n".join(diagnostic)
+
+
+def run_mode_label(args: argparse.Namespace) -> str:
+    if args.dry_run:
+        return "dry_run"
+    if getattr(args, "no_create_doc", False):
+        return "local_only"
+    if args.update_existing:
+        return "update_existing"
+    return "create_doc"
+
+
+def lark_doc_creation_status(action: str, doc_url: str | None, args: argparse.Namespace) -> str:
+    if args.dry_run:
+        return "skipped_dry_run"
+    if getattr(args, "no_create_doc", False):
+        return "skipped_no_create_doc"
+    if doc_url:
+        return "updated" if args.update_existing and action.startswith("updated") else "created"
+    return "failed"
 
 
 def valid_lark_open_id(value: str | None) -> bool:
@@ -2629,6 +3067,10 @@ def process_single(prep_input: PrepInput, args: argparse.Namespace, *, event: di
     context = build_context(prep_input, event=event, debug=args.debug)
     render_json = context_to_renderer_json(context, args)
     markdown = render(render_json)
+    validation_warnings = validate_rendered_output(render_json, markdown)
+    if validation_warnings:
+        render_json.setdefault("source_status", {})["output_validation"] = "; ".join(validation_warnings)
+        markdown = render(render_json)
     title = doc_title(render_json)
     json_path, md_path = write_local_outputs(render_json, markdown, title)
     debug_log(args.debug, f"wrote local JSON: {json_path}")
@@ -2636,7 +3078,43 @@ def process_single(prep_input: PrepInput, args: argparse.Namespace, *, event: di
 
     existing = choose_existing_doc(context.prior_docs, context.customer.canonical_name)
     doc_url, action = create_or_update_doc(markdown_path=md_path, title=title, existing_doc=existing, args=args, debug=args.debug)
-    result = PrepResult(title, doc_url, prep_input.mode, context.customer.canonical_name, context.customer.confidence, context.missing_context)
+    lark_status = lark_doc_creation_status(action, doc_url, args)
+    render_json.setdefault("source_status", {})["lark_doc_creation"] = lark_status
+    if doc_url:
+        render_json.setdefault("lark_doc", {})["url"] = doc_url
+    markdown = render(render_json)
+    validation_warnings = validate_rendered_output(render_json, markdown)
+    if validation_warnings:
+        render_json.setdefault("source_status", {})["output_validation"] = "; ".join(validation_warnings)
+        markdown = render(render_json)
+    json_path, md_path = write_local_outputs(render_json, markdown, title)
+    if doc_url:
+        parity = run_lark(["docs", "+update", "--doc", doc_url, "--markdown", lark_markdown_arg(md_path), "--mode", "overwrite", "--new-title", title, "--as", "user"], debug=args.debug)
+        if not parity.get("ok"):
+            render_json.setdefault("source_status", {})["lark_doc_parity_update"] = "failed"
+            markdown = render(render_json)
+            json_path, md_path = write_local_outputs(render_json, markdown, title)
+    debug_log(args.debug, f"updated local JSON with Lark status: {json_path}")
+    debug_log(args.debug, f"updated local Markdown with Lark status: {md_path}")
+    missing_context = list(context.missing_context)
+    if lark_status == "failed":
+        missing_context.append("lark_doc_creation: failed")
+    summary_confidence = (
+        render_json.get("confidence_layers", {}).get("identity_confidence")
+        or context.customer.confidence
+    )
+    result = PrepResult(
+        title,
+        doc_url,
+        prep_input.mode,
+        context.customer.canonical_name,
+        summary_confidence,
+        missing_context,
+        local_json_path=str(json_path),
+        local_markdown_path=str(md_path),
+        run_mode=run_mode_label(args),
+        lark_doc_status=lark_status,
+    )
     notify_status = send_notification(result, context, args, debug=args.debug)
     if args.output_json:
         print(json.dumps({"normalized": render_json, "result": asdict(result), "action": action, "notification": notify_status}, indent=2))
@@ -2646,15 +3124,20 @@ def process_single(prep_input: PrepInput, args: argparse.Namespace, *, event: di
 
 
 def print_summary(result: PrepResult, action: str, notify_status: str, context: PrepContext) -> None:
-    print("Meeting prep generated.")
+    print("Prep generation completed.")
     print()
     print(f"Customer: {result.customer_name or 'Unknown'}")
     print(f"Confidence: {result.confidence}")
     print(f"Mode: {result.mode}")
-    print(f"Doc: {result.doc_url or 'Local markdown fallback'}")
+    print(f"Lark Doc: {result.doc_url or action}")
+    print(f"Local Markdown: {result.local_markdown_path or 'unavailable'}")
+    print(f"Local JSON: {result.local_json_path or 'unavailable'}")
+    print(f"Run Mode: {result.run_mode or 'unknown'}")
     print(f"Doc action: {action}")
     print(f"Prior docs found: {len(context.prior_docs)}")
     print(f"Notification: {notify_status}")
+    if result.lark_doc_status == "failed":
+        print("Local fallback was generated successfully")
     if result.missing_context:
         print("Missing context:")
         for item in result.missing_context:

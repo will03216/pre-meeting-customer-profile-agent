@@ -104,7 +104,7 @@ def test_dedupe_logic_update_existing() -> None:
 
 
 def test_dry_run_does_not_create_or_notify(tmp_path, monkeypatch) -> None:
-    args = argparse.Namespace(dry_run=True, update_existing=False)
+    args = argparse.Namespace(dry_run=True, no_create_doc=False, update_existing=False)
     md_path = tmp_path / "prep.md"
     md_path.write_text("# Prep\n", encoding="utf-8")
     doc_url, action = run_prep.create_or_update_doc(
@@ -114,7 +114,75 @@ def test_dry_run_does_not_create_or_notify(tmp_path, monkeypatch) -> None:
         args=args,
     )
     assert doc_url is None
-    assert action == "dry-run: no Lark write"
+    assert action == "Lark doc creation skipped because --dry-run was used"
+
+
+def test_default_create_doc_attempts_lark_creation(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_run_lark(cmd, debug=False):
+        calls.append(cmd)
+        return {"ok": True, "data": {"doc_url": "https://bytedance.sg.larkoffice.com/docx/new"}}
+
+    monkeypatch.setattr(run_prep, "run_lark", fake_run_lark)
+    args = argparse.Namespace(dry_run=False, no_create_doc=False, update_existing=False)
+    md_path = tmp_path / "prep.md"
+    md_path.write_text("# Prep\n", encoding="utf-8")
+    doc_url, action = run_prep.create_or_update_doc(
+        markdown_path=md_path,
+        title="BytePlus <> IPG - TBD - Pre-Meeting Prep",
+        existing_doc=None,
+        args=args,
+    )
+    assert doc_url == "https://bytedance.sg.larkoffice.com/docx/new"
+    assert action == "created Lark doc"
+    assert calls and calls[0][:2] == ["docs", "+create"]
+
+
+def test_no_create_doc_skips_lark_creation(tmp_path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(run_prep, "run_lark", lambda *args, **kwargs: calls.append(args) or {"ok": True})
+    args = argparse.Namespace(dry_run=False, no_create_doc=True, update_existing=False)
+    md_path = tmp_path / "prep.md"
+    md_path.write_text("# Prep\n", encoding="utf-8")
+    doc_url, action = run_prep.create_or_update_doc(
+        markdown_path=md_path,
+        title="BytePlus <> Apple - TBD - Pre-Meeting Prep",
+        existing_doc=None,
+        args=args,
+    )
+    assert doc_url is None
+    assert action == "Lark doc creation skipped because --no-create-doc was used"
+    assert calls == []
+
+
+def test_local_outputs_are_written_and_summary_is_clear(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(run_prep, "OUTPUT_ROOT", tmp_path)
+    payload = {"meeting": {}, "customer": {"name": "Apple"}, "source_status": {"lark_doc_creation": "created"}}
+    json_path, md_path = run_prep.write_local_outputs(payload, "# Prep", "BytePlus <> Apple - TBD - Pre-Meeting Prep")
+    assert json_path.exists()
+    assert md_path.exists()
+
+    result = run_prep.PrepResult(
+        "BytePlus <> Apple - TBD - Pre-Meeting Prep",
+        "https://bytedance.sg.larkoffice.com/docx/new",
+        "contact-company",
+        "Apple",
+        "confirmed",
+        [],
+        local_json_path=str(json_path),
+        local_markdown_path=str(md_path),
+        run_mode="create_doc",
+        lark_doc_status="created",
+    )
+    context = run_prep.PrepContext(run_prep.CustomerIdentity("Apple", None, None, "confirmed", []), None, [], None, [])
+    run_prep.print_summary(result, "created Lark doc", "notification skipped", context)
+    out = capsys.readouterr().out
+    assert "Prep generation completed." in out
+    assert "Lark Doc: https://bytedance.sg.larkoffice.com/docx/new" in out
+    assert f"Local Markdown: {md_path}" in out
+    assert f"Local JSON: {json_path}" in out
+    assert "Run Mode: create_doc" in out
 
 
 def test_lark_markdown_arg_uses_relative_path_inside_cwd(tmp_path, monkeypatch) -> None:
@@ -531,21 +599,25 @@ def test_question_filtering_by_vertical() -> None:
         {"name": "marketing_adtech"},
     )
     marketing_text = "\n".join(item["question"] + " " + item["section"] for item in marketing_questions)
-    assert "What metric are they focused on?" in marketing_text
+    assert "Current AI adoption?" in marketing_text
     assert "Current Stack" in marketing_text
-    assert any("Gaming-only" in item for item in marketing_omitted)
+    assert any("Product-specific" in item for item in marketing_omitted)
 
-    video_questions, _, _ = run_prep.build_question_prefill(context_for_vertical("AI video creative studio video generation"), {"name": "ai_video_creative"})
+    video_questions, _, _ = run_prep.build_question_prefill(
+        context_for_vertical("AI video creative studio video generation"),
+        {"name": "ai_video_creative", "confidence": "confirmed"},
+        {"active_workload_confidence": "likely"},
+    )
     assert any(item["section"] == "Image / Video Usage" for item in video_questions)
 
     llm_questions, _, _ = run_prep.build_question_prefill(context_for_vertical("LLM token usage model routing"), {"name": "enterprise_llm"})
     assert any("Monthly token usage" in item["question"] for item in llm_questions)
 
     ecommerce_questions, _, _ = run_prep.build_question_prefill(context_for_vertical("ecommerce SKU catalog product recommendation"), {"name": "ecommerce"})
-    assert any("SKU" in item["question"] or "Catalog" in item["question"] for item in ecommerce_questions)
+    assert any("Current AI adoption" in item["question"] for item in ecommerce_questions)
 
     gaming_questions, _, _ = run_prep.build_question_prefill(context_for_vertical("gaming NPC asset generation"), {"name": "gaming"})
-    assert any("Game genre" in item["question"] for item in gaming_questions)
+    assert any("Game/company scope" in item["question"] for item in gaming_questions)
 
     default_questions, _, _ = run_prep.build_question_prefill(context_for_vertical("unknown"), {"name": "default"})
     assert any("Current AI adoption" in item["question"] for item in default_questions)
@@ -846,7 +918,7 @@ def test_unknown_person_only_risk_pain_points_and_context_confidence_are_conserv
     rendered = render_prep_doc.render(payload)
     assert "Customer Context Confidence | Weak / Person-only input. No confirmed company, domain, calendar event, or active workload found." in rendered
     assert "Risk | To Validate: budget, decision maker, timeline, current vendor, and success metrics are not confirmed." in rendered
-    assert "Pain Points | To Validate: no confirmed pain point found. Missing budget, decision maker, timeline, current vendor, and success metrics should be validated in the meeting." in rendered
+    assert "Pain Points | To Validate: confirm whether the customer is focused on creative production, media optimization, workflow automation, model/API infrastructure, cost, quality, latency, or deployment." in rendered
     assert "Risk | Likely: Missing confirmed" not in rendered
     assert "Pain Points | Likely: Missing confirmed" not in rendered
     assert "Likely: Seedance" not in rendered
@@ -1147,7 +1219,7 @@ def test_confirmed_domain_direct_homepage_fetch_populates_apple_overview(monkeyp
 def test_apple_homepage_nav_text_is_normalized() -> None:
     raw = "Apple Apple Apple Store Mac iPad iPhone Watch Vision AirPods TV & Home Entertainment Accessories Support 0 + MacBook Neo Amazing Mac. Learn more Buy WWDC 26 Apple Worldwide Developers Conference. Learn more Apple Card Special new Apple Card and AirPods Pro 3 offer."
     normalized = run_prep.clean_overview_snippet(raw, "Apple")
-    expected = "Apple is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across products such as iPhone, Mac, iPad, Apple Watch, Vision, AirPods, and Apple TV."
+    expected = "Apple is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across major product and ecosystem categories."
     assert normalized == expected
     assert "Apple Apple Apple Store" not in normalized
 
@@ -1192,7 +1264,7 @@ def test_apple_homepage_nav_text_is_normalized() -> None:
     ]
     rendered = render_prep_doc.render(payload)
     assert "What They Do | Known: Apple is a global technology company" in rendered
-    assert "**Core Business Hypothesis:** Apple is a global technology company" in rendered
+    assert "**Core Business Hypothesis:** Known: Apple is a global technology company" in rendered
     assert "- **Pre-filled answer (Known)**: Apple is a global technology company" in rendered
     assert "| Core Business | Known: Apple is a global technology company" in rendered
     assert "Apple Apple Apple Store" not in rendered
@@ -1318,7 +1390,7 @@ def test_apple_official_evidence_populates_overview_and_status() -> None:
     ]
     rendered = render_prep_doc.render(payload)
     assert "What They Do | Known: Apple is a global technology company" in rendered
-    assert "**Core Business Hypothesis:** Apple is a global technology company" in rendered
+    assert "**Core Business Hypothesis:** Known: Apple is a global technology company" in rendered
     assert "| Core Business | Known: Apple is a global technology company" in rendered
     assert "- **Pre-filled answer (Known)**: Apple is a global technology company" in rendered
     assert "- web_search: ran_but_all_results_filtered" not in rendered
@@ -1416,7 +1488,7 @@ def test_ipg_confirmed_company_overview_enriches_business_but_gates_workload() -
         confirmed_domain="interpublic.com",
         contact_name="Juan manuel Sepulveda",
     )
-    assert dossier["what_they_do"].startswith("Interpublic Group (IPG) is a global advertising and marketing services holding company")
+    assert dossier["what_they_do"].startswith("Interpublic Group (IPG) is an advertising and marketing services company")
     assert "global brands" in dossier["target_users"]
     assert "media planning/buying" in dossier["business_model"]
     assert any("billion" in item.lower() for item in dossier["scale_signals"])
@@ -1459,13 +1531,319 @@ def test_ipg_confirmed_company_overview_enriches_business_but_gates_workload() -
     for value in forbidden:
         assert value not in rendered
     assert "Juan manuel Sepulveda at Interpublic Group (IPG)" in rendered
-    assert "What They Do | Known: Interpublic Group (IPG) is a global advertising and marketing services holding company" in rendered
+    assert "What They Do | Known: Interpublic Group (IPG) is an advertising and marketing services company" in rendered
     assert "Target Users / Customer Segments | Likely: global brands, advertisers, enterprise marketing teams, media buyers, and agency clients (?)" in rendered
     assert "Business Model / Revenue Model | Likely: advertising, marketing services, media planning/buying" in rendered
-    assert "Main AI Use Cases | To Validate: no confirmed AI workload or BytePlus use case found from current sources." in rendered
+    assert "Main AI Use Cases | To Validate: active AI or BytePlus-relevant workload is not confirmed." in rendered
     assert "Product Modules | To Validate: identify active workload first; possible product modules depend on confirmed use case." in rendered
     assert "Expansion Opportunity | To Validate: identify active workload first." in rendered
     assert "Likely: Ark / model platform" not in rendered
+
+
+def guarded_render(payload: dict, explicit_industry: str | None = None) -> str:
+    run_prep.apply_production_field_guards(payload, explicit_industry)
+    return render_prep_doc.render(payload)
+
+
+def subtype_payload(company: str, domain: str, description: str, vertical_name: str = "default", explicit_industry: str | None = None) -> dict:
+    payload = base_render_payload()
+    payload["customer"] = {"name": company, "company_name": company, "domain": domain, "website": domain, "description": description}
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": vertical_name, "display_name": vertical_name.replace("_", " ").title(), "confidence": "likely", "evidence": [description]}
+    payload["enrichment"] = {
+        "available": True,
+        "known_use_cases": [],
+        "possible_byteplus_fit": [{"product": "Ark / model platform", "reason": "should be gated without workload", "confidence": "medium"}],
+        "dossier": {
+            "company": company,
+            "what_they_do": description,
+            "target_users": "",
+            "business_model": "",
+            "source_evidence": [],
+        },
+    }
+    run_prep.apply_production_field_guards(payload, explicit_industry)
+    return payload
+
+
+def test_vertical_subtype_templates_are_current_company_specific() -> None:
+    ipg = subtype_payload(
+        "Interpublic Group (IPG)",
+        "interpublic.com",
+        "Interpublic Group (IPG) is a global advertising and marketing services holding company with agency networks across creative, media, data, technology, communications, and brand marketing services.",
+        "marketing_adtech",
+    )
+    assert "global brands" in ipg["enrichment"]["dossier"]["target_users"]
+    assert "media planning/buying" in ipg["enrichment"]["dossier"]["business_model"]
+    assert "high-intent consumers" not in ipg["enrichment"]["dossier"]["target_users"]
+
+    natural = subtype_payload(
+        "Natural Intelligence",
+        "naturalint.com",
+        "Natural Intelligence is an intent-marketing and customer-acquisition company focused on comparison and performance marketing platforms.",
+        "marketing_adtech",
+    )
+    assert "high-intent consumers" in natural["enrichment"]["dossier"]["target_users"]
+    assert "comparison content" in natural["enrichment"]["dossier"]["business_model"]
+    assert "hardware sales" not in natural["enrichment"]["dossier"]["business_model"]
+
+    keshet = subtype_payload(
+        "Keshet Media Group",
+        "keshetinternational.com",
+        "Keshet Media Group is a media and entertainment company with broadcasting, streaming, production, format licensing, global distribution, and content distribution businesses.",
+        "default",
+    )
+    assert "broadcasters/streamers" in keshet["enrichment"]["dossier"]["target_users"]
+    assert "broadcasting, streaming" in keshet["enrichment"]["dossier"]["business_model"]
+    assert "comparison content" not in keshet["enrichment"]["dossier"]["business_model"]
+
+    apple = subtype_payload(
+        "Apple",
+        "apple.com",
+        "Apple is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across major product and ecosystem categories.",
+        "default",
+    )
+    assert "consumers, developers" in apple["enrichment"]["dossier"]["target_users"]
+    assert "hardware sales" in apple["enrichment"]["dossier"]["business_model"]
+
+    freepik = subtype_payload(
+        "Freepik",
+        "freepik.es",
+        "Freepik is a creative platform offering design assets, templates, and AI-enabled image/video tools.",
+        "ai_video_creative",
+        "ai_video_creative",
+    )
+    assert "creators, designers" in freepik["enrichment"]["dossier"]["target_users"]
+    assert "asset licensing" in freepik["enrichment"]["dossier"]["business_model"]
+    assert "App Store" not in freepik["enrichment"]["dossier"]["business_model"]
+
+
+def test_cross_run_guard_blocks_previous_customer_templates_in_same_process() -> None:
+    apple = subtype_payload(
+        "Apple",
+        "apple.com",
+        "Apple is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across major product and ecosystem categories.",
+    )
+    assert "hardware sales" in apple["enrichment"]["dossier"]["business_model"]
+
+    natural = subtype_payload(
+        "Natural Intelligence",
+        "naturalint.com",
+        "Natural Intelligence is an intent-marketing and customer-acquisition company focused on comparison and performance marketing platforms.",
+        "marketing_adtech",
+    )
+    natural_rendered = render_prep_doc.render(natural)
+    assert "consumer devices" not in natural_rendered
+    assert "hardware sales" not in natural_rendered
+
+    ipg = subtype_payload(
+        "Interpublic Group (IPG)",
+        "interpublic.com",
+        "Interpublic Group (IPG) is a global advertising and marketing services holding company with agency networks across creative, media, data, technology, communications, and brand marketing services.",
+        "marketing_adtech",
+    )
+    ipg_rendered = render_prep_doc.render(ipg)
+    assert "intent-marketing / comparison-platform" not in ipg_rendered
+    assert "high-intent consumers" not in ipg_rendered
+
+    keshet = subtype_payload(
+        "Keshet Media Group",
+        "keshetinternational.com",
+        "Keshet Media Group is a media and entertainment company with broadcasting, streaming, production, and content distribution businesses.",
+    )
+    keshet_rendered = render_prep_doc.render(keshet)
+    assert "agency network services" not in keshet_rendered
+    assert "high-intent consumers" not in keshet_rendered
+
+    freepik = subtype_payload(
+        "Freepik",
+        "freepik.es",
+        "Freepik is a creative platform offering design assets, templates, and AI-enabled image/video tools.",
+        "ai_video_creative",
+        "ai_video_creative",
+    )
+    freepik_rendered = render_prep_doc.render(freepik)
+    assert "hardware sales" not in freepik_rendered
+    assert "App Store ecosystem" not in freepik_rendered
+
+    fabien = base_render_payload()
+    fabien["customer"] = {"name": "Fabien Siderakis", "company_name": "", "domain": "", "website": ""}
+    fabien["customer_context"] = {"classification": "person_only"}
+    fabien["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    fabien["enrichment"] = {"available": True, "dossier": {"target_users": "TV/streaming audiences", "business_model": "broadcasting, streaming"}}
+    guarded_render(fabien)
+    assert "target users/customer segments are not confirmed" in fabien["enrichment"]["dossier"]["target_users"]
+    assert "business model/revenue model is not confirmed" in fabien["enrichment"]["dossier"]["business_model"]
+
+
+def test_compatibility_guard_downgrades_wrong_vertical_fields_before_render() -> None:
+    payload = subtype_payload(
+        "Keshet Media Group",
+        "keshetinternational.com",
+        "Keshet Media Group is a media and entertainment company with broadcasting and content distribution businesses.",
+    )
+    payload["enrichment"]["dossier"]["target_users"] = "high-intent consumers and brand/advertiser partners"
+    payload["enrichment"]["dossier"]["business_model"] = "intent-marketing / comparison-platform model connecting consumers with brands"
+    run_prep.apply_production_field_guards(payload)
+    rendered = render_prep_doc.render(payload)
+    assert "high-intent consumers" not in rendered
+    assert "intent-marketing / comparison-platform" not in rendered
+    assert "field_validation" in payload["source_status"]
+
+
+def test_explicit_ai_video_web_failure_fallback_is_likely_without_fake_evidence() -> None:
+    payload = base_render_payload()
+    payload["customer"] = {"name": "Freepik", "company_name": "Freepik", "domain": "freepik.es", "website": "freepik.es"}
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "ai_video_creative", "display_name": "AI Video / Creative", "confidence": "confirmed", "evidence": ["Explicit CLI --industry ai_video_creative"]}
+    payload["source_status"] = {**payload["source_status"], "web_search": "request_failed", "company_overview_enrichment": "no_overview_eligible_results"}
+    payload["enrichment"] = {"available": True, "known_use_cases": [], "possible_byteplus_fit": [], "dossier": {"company": "Freepik", "what_they_do": "To Validate: business description could not be enriched because web search/fetch was unavailable.", "source_evidence": []}}
+    rendered = guarded_render(payload, "ai_video_creative")
+    assert "What They Do | Likely: Freepik appears to be a creative platform for design assets and AI-enabled image/video workflows. (?)" in rendered
+    assert "**Core Business Hypothesis:** Likely: Freepik appears to be a creative platform for design assets and AI-enabled image/video workflows. (?)" in rendered
+    assert "| Core Business | Likely: Freepik appears to be a creative platform for design assets and AI-enabled image/video workflows. (?)" in rendered
+    assert "Evidence:" not in rendered.split("| What They Do |", 1)[1].split("\n", 1)[0]
+    assert "No evidence table available." in rendered.split("## Evidence Table", 1)[1]
+    assert "https://freepik" not in rendered.split("## Evidence Table", 1)[1]
+
+
+def test_broad_marketing_flag_does_not_make_product_fit_likely() -> None:
+    payload = subtype_payload(
+        "Natural Intelligence",
+        "naturalint.com",
+        "Natural Intelligence is an intent-marketing and customer-acquisition company focused on comparison and performance marketing platforms.",
+        "marketing_adtech",
+    )
+    payload["confidence_layers"] = {
+        "identity_confidence": "confirmed_company",
+        "company_vertical_confidence": "confirmed",
+        "active_workload_confidence": "unknown",
+        "product_fit_confidence": "possible_after_validation",
+    }
+    payload["enrichment"]["known_use_cases"] = [
+        "performance marketing and customer acquisition workflow",
+        "consumer comparison platform content and ranking workflow",
+    ]
+    payload["enrichment"]["possible_byteplus_fit"] = [
+        {"product": "Ark / model platform", "reason": "should stay gated", "confidence": "medium"},
+        {"product": "Seedance", "reason": "should stay gated", "confidence": "medium"},
+        {"product": "Seedream", "reason": "should stay gated", "confidence": "medium"},
+    ]
+    rendered = render_prep_doc.render(payload)
+    assert "Product Modules | To Validate: identify active workload first; possible product modules depend on confirmed use case." in rendered
+    assert "Likely: Ark / model platform" not in rendered
+    assert "Likely: Seedance" not in rendered
+    assert "Likely: Seedream" not in rendered
+    assert "Possible directions after validation" in rendered or "Possible direction after validation" in rendered
+
+
+def evidence_filter_payload(company: str, subtype: str, good_claim: str, bad_claim: str) -> dict:
+    payload = base_render_payload()
+    payload["run_id"] = "run-test"
+    payload["customer_key"] = company.lower().replace(" ", "-")
+    payload["customer"] = {"name": company, "company_name": company, "domain": "example.com", "website": "example.com"}
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": [], "subtype": {"name": subtype}}
+    payload["enrichment"] = {
+        "available": True,
+        "dossier": {
+            "company": company,
+            "vertical_subtype": {"name": subtype},
+            "source_evidence": [],
+        },
+    }
+    payload["evidence_registry"] = [
+        {
+            "claim": good_claim,
+            "claim_text": good_claim,
+            "claim_type": "company_overview",
+            "source_url": "https://example.com/good",
+            "url": "https://example.com/good",
+            "tier_label": "Tier 1 - official company site",
+            "source_classification": "customer_evidence",
+            "run_id": "run-test",
+            "customer_key": payload["customer_key"],
+        },
+        {
+            "claim": bad_claim,
+            "claim_text": bad_claim,
+            "claim_type": "company_overview",
+            "source_url": "https://example.com/bad",
+            "url": "https://example.com/bad",
+            "tier_label": "Tier 3 - business profile",
+            "source_classification": "customer_evidence",
+            "run_id": "run-test",
+            "customer_key": payload["customer_key"],
+        },
+    ]
+    return payload
+
+
+def test_evidence_table_drops_incompatible_consumer_tech_row_for_media_company() -> None:
+    payload = evidence_filter_payload(
+        "Keshet Media Group",
+        "media_entertainment_content",
+        "Keshet Media Group is a media and entertainment company with broadcasting, streaming, production, news, and international content distribution businesses.",
+        "Keshet Media Group is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across major product and ecosystem categories.",
+    )
+    rendered = render_prep_doc.render(payload)
+    evidence = rendered.split("## Evidence Table", 1)[1].split("## Run Report", 1)[0]
+    assert "media and entertainment company" in evidence
+    assert "consumer devices" not in evidence
+    assert "field_validation: dropped_incompatible_evidence_row" in rendered
+
+
+def test_evidence_table_drops_cross_vertical_rows_for_regressions() -> None:
+    natural = evidence_filter_payload(
+        "Natural Intelligence",
+        "intent_marketing_comparison",
+        "Natural Intelligence is an intent-marketing and customer-acquisition company focused on connecting consumers with brands through comparison and performance marketing platforms.",
+        "Natural Intelligence is a global technology company offering consumer devices, software, services, accessories, and app ecosystem categories.",
+    )
+    natural_evidence = render_prep_doc.render(natural).split("## Evidence Table", 1)[1].split("## Run Report", 1)[0]
+    assert "intent-marketing and customer-acquisition" in natural_evidence
+    assert "consumer devices" not in natural_evidence
+
+    ipg = evidence_filter_payload(
+        "Interpublic Group (IPG)",
+        "agency_marketing_services",
+        "Interpublic Group (IPG) is an advertising and marketing services company with capabilities across creative, media, data, technology, communications, and brand marketing services.",
+        "Interpublic Group (IPG) runs an intent-marketing / comparison-platform business model for high-intent consumers.",
+    )
+    ipg_evidence = render_prep_doc.render(ipg).split("## Evidence Table", 1)[1].split("## Run Report", 1)[0]
+    assert "advertising and marketing services company" in ipg_evidence
+    assert "comparison-platform business model" not in ipg_evidence
+
+    freepik = evidence_filter_payload(
+        "Freepik",
+        "creative_platform",
+        "Freepik is a creative platform offering design assets, templates, and AI-enabled image/video tools for creators, marketers, agencies, and enterprise creative teams.",
+        "Freepik has a hardware sales, App Store ecosystem, accessories, and support business model.",
+    )
+    freepik_evidence = render_prep_doc.render(freepik).split("## Evidence Table", 1)[1].split("## Run Report", 1)[0]
+    assert "creative platform offering design assets" in freepik_evidence
+    assert "hardware sales" not in freepik_evidence
+
+
+def test_weak_person_only_evidence_table_remains_empty() -> None:
+    payload = base_render_payload()
+    payload["customer"] = {"name": "Fabien Siderakis", "company_name": "", "domain": "", "website": ""}
+    payload["customer_context"] = {"classification": "person_only"}
+    payload["vertical"] = {"name": "default", "display_name": "Default / Unknown", "confidence": "unknown", "evidence": []}
+    payload["evidence_registry"] = [
+        {
+            "claim": "A random company overview should not appear for a weak person-only input.",
+            "claim_text": "A random company overview should not appear for a weak person-only input.",
+            "claim_type": "company_overview",
+            "source_url": "https://example.com/random",
+            "url": "https://example.com/random",
+            "tier_label": "Tier 3 - business profile",
+            "source_classification": "candidate_entity_evidence",
+        }
+    ]
+    rendered = render_prep_doc.render(payload)
+    assert "No evidence table available." in rendered.split("## Evidence Table", 1)[1]
+    assert "random company overview" not in rendered.split("## Evidence Table", 1)[1]
 
 
 def test_hq_location_extraction_does_not_include_revenue_phrase() -> None:
@@ -1597,3 +1975,94 @@ def test_output_json_shape_for_normalized_context() -> None:
     )
     payload = {"normalized": run_prep.context_to_renderer_json(context)}
     assert json.loads(json.dumps(payload))["normalized"]["customer"]["name"] == "Moburst"
+
+
+def test_company_vertical_without_workload_keeps_products_gated() -> None:
+    payload = base_render_payload()
+    overview = "Example Agency is a global advertising and marketing services company serving brands, media buyers, and agency clients."
+    payload["customer"] = {
+        "name": "Example Agency",
+        "company_name": "Example Agency",
+        "domain": "exampleagency.com",
+        "website": "exampleagency.com",
+        "description": overview,
+    }
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["vertical"] = {
+        "name": "marketing_adtech",
+        "display_name": "Marketing / AdTech",
+        "confidence": "likely",
+        "evidence": ["Matched signal: advertising", "Matched signal: marketing services"],
+    }
+    payload["confidence_layers"] = {
+        "identity_confidence": "confirmed_company",
+        "company_vertical_confidence": "likely",
+        "active_workload_confidence": "unknown",
+        "product_fit_confidence": "possible_after_validation",
+    }
+    payload["enrichment"] = {
+        "available": True,
+        "known_use_cases": [],
+        "possible_byteplus_fit": [{"product": "Ark / model platform", "reason": "Should not unlock from vertical alone", "confidence": "medium"}],
+        "dossier": {
+            "company": "Example Agency",
+            "what_they_do": overview,
+            "product_modules": ["API / enterprise plans"],
+            "source_evidence": [
+                {"claim": overview, "url": "https://exampleagency.com", "tier_label": "Tier 1 - official company site", "source_classification": "customer_evidence"}
+            ],
+        },
+    }
+    rendered = render_prep_doc.render(payload)
+    assert "Product Modules | To Validate: identify active workload first; possible product modules depend on confirmed use case." in rendered
+    assert "Main AI Use Cases | To Validate: active AI or BytePlus-relevant workload is not confirmed." in rendered
+    assert "Cross-Sell Potential | To Validate: identify active workload first." in rendered
+    assert "Likely: Ark / model platform" not in rendered
+    assert "Which image/video generation capabilities are most important" not in rendered
+    assert "Question Coverage Matrix" not in rendered
+
+
+def test_explicit_ai_video_workload_allows_creative_questions_and_fit() -> None:
+    context = run_prep.PrepContext(
+        customer=run_prep.CustomerIdentity("Creative Co", "creative.example", None, "confirmed", ["test"], company_name="Creative Co"),
+        event=None,
+        prior_docs=[],
+        enrichment={
+            "available": True,
+            "description": "Creative Co offers an AI video creative platform.",
+            "known_use_cases": ["video generation / short-form creative workflow"],
+            "possible_byteplus_fit": [{"product": "Seedance", "reason": "Validate video generation fit", "confidence": "medium"}],
+        },
+        missing_context=[],
+    )
+    vertical = {"name": "ai_video_creative", "display_name": "AI Video / Creative", "confidence": "confirmed", "evidence": ["Explicit CLI --industry ai_video_creative"]}
+    layers = run_prep.infer_confidence_layers(context, vertical)
+    questions, _, _ = run_prep.build_question_prefill(context, vertical, layers)
+    joined = "\n".join(item["question"] for item in questions)
+    assert layers["active_workload_confidence"] == "likely"
+    assert "Daily generations?" in joined
+    assert "Current vendors?" in joined
+
+
+def test_evidence_table_deduplicates_overview_claims() -> None:
+    payload = base_render_payload()
+    claim = "Apple is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across major product and ecosystem categories."
+    payload["customer"] = {"name": "Apple", "company_name": "Apple", "domain": "apple.com", "website": "apple.com", "description": claim}
+    payload["customer_context"] = {"classification": "confirmed_company"}
+    payload["enrichment"] = {
+        "available": True,
+        "dossier": {
+            "company": "Apple",
+            "what_they_do": claim,
+            "source_evidence": [
+                {"claim": claim, "url": "https://apple.com", "tier_label": "Tier 1 - official company site", "source_classification": "customer_evidence"},
+                {"claim": claim, "url": "https://www.apple.com/about", "tier_label": "Tier 1 - official company site", "source_classification": "customer_evidence"},
+                {"claim": "Apple Apple Apple Store Mac iPad iPhone Watch Vision AirPods TV & Home Entertainment Accessories Support Learn more Buy", "url": "https://apple.com/noisy", "tier_label": "Tier 1 - official company site", "source_classification": "customer_evidence"},
+            ],
+        },
+    }
+    rendered = render_prep_doc.render(payload)
+    evidence = rendered.split("## Evidence Table", 1)[1]
+    assert evidence.count("Apple is a global technology company") == 1
+    assert "Apple Apple Apple Store" not in evidence
+    assert "Official company overview" not in rendered
