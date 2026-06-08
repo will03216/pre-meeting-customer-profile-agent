@@ -1,0 +1,53 @@
+name: polym-customer-prospect
+version: 0.1.0
+stage: beta
+owners:
+  - SA Team
+
+description_for_install: |
+  Customer prospection and profiling for pre-meeting preparation.
+  Given a company name, URL, and/or contact person (none required as
+  a hard blocker), gathers multi-source intelligence:
+    • Apollo.io organization + people enrichment
+    • Company website + domain web scraping
+    • Web search: AI news, LinkedIn, funding, MAU, competitor signals
+    • SA Wiki: existing knowledge and prior engagement history
+  Synthesizes a comprehensive Lark prospection document covering
+  company overview, AI/ML stack (including third-party resellers),
+  vertical analysis, competitive landscape, BytePlus opportunity
+  assessment (text / image / video models), and tailored AE + SA
+  meeting questions. Then archives a summary to the SA Wiki.
+
+depends_on:
+  skills:
+    - polym-sa-wiki
+  binaries:
+    - lark-cli: ">=1.0.20"
+  env:
+    - APOLLO_API_KEY: "Apollo.io API key (optional — skip enrichment if absent)"
+    - PROSPECTS_FOLDER_TOKEN: "Lark folder token for prospection docs (optional)"
+
+io_contract:
+  reads:
+    - web: company website, LinkedIn public pages, news, Crunchbase
+    - apollo: organization enrichment, people/contacts search
+    - polym-sa-wiki: existing customer knowledge and engagement history
+  writes:
+    - lark_doc: standalone prospection Lark document (always)
+
+triggers:
+  - "customer prospect"
+  - "prospect this company"
+  - "prepare for customer meeting"
+  - "customer profile"
+  - "pre-meeting research"
+  - "company research"
+  - "公司调研"
+  - "客户调研"
+  - "帮我准备客户会议"
+  - "做个客户画像"
+  - "客户prospect"
+  - "会前准备"
+  - "帮我查一下这个公司"
+
+deprecates: []
