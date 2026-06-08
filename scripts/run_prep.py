@@ -33,6 +33,14 @@ except ImportError:  # pragma: no cover - defensive for unusual launch paths
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from render_prep_doc import render
 
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from enrichment.apollo_enrichment import enrich_with_apollo as _enrich_with_apollo
+    from enrichment.apollo_enrichment import apollo_result_to_dict as _apollo_result_to_dict
+    _APOLLO_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _APOLLO_AVAILABLE = False
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_ROOT = REPO_ROOT / "outputs" / "prep"
@@ -89,6 +97,7 @@ class PrepInput:
     contact: str | None = None
     company: str | None = None
     domain: str | None = None
+    user_urls: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -115,6 +124,8 @@ class PrepContext:
     web_search_status: str = "disabled_or_not_configured"
     company_overview_status: str = "disabled_or_not_configured"
     known: dict[str, Any] = field(default_factory=dict)
+    apollo_enrichment: dict[str, Any] | None = None
+    user_urls: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -150,6 +161,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contact", help="Contact/stakeholder person name; use with --company and/or --domain.")
     parser.add_argument("--company", help="Confirmed company name; may be used with --contact and/or --domain.")
     parser.add_argument("--domain", help="Confirmed company domain; may be used alone or with --contact/--company/--customer.")
+    parser.add_argument("--url", action="append", dest="urls", default=[],
+                        help="Explicit public URL(s) to use as direct enrichment sources (e.g. company website, startup profile). Can be repeated.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-json", action="store_true")
     parser.add_argument("--create-doc", action="store_true", help="Explicitly allow new doc creation; this is the default outside dry-run.")
@@ -159,6 +172,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prospecting-prompt", help="Path to prospecting prompt guidance; defaults to config/prospecting_prompt.md.")
     parser.add_argument("--industry", help="Industry playbook name, e.g. marketing_adtech, ai_video_creative, ecommerce, gaming, enterprise_llm.")
     parser.add_argument("--workload", help="Explicit active workload, e.g. video_generation, image_generation, llm_platform, model_api.")
+    parser.add_argument("--no-apollo", action="store_true", help="Disable Apollo.io enrichment for this run.")
+    parser.add_argument("--apollo-refresh", action="store_true", help="Bypass Apollo cache and fetch fresh data.")
+    parser.add_argument("--apollo-max-people", type=int, default=None, help="Max stakeholder candidates to fetch from Apollo (default: APOLLO_MAX_PEOPLE env or 5).")
+    parser.add_argument("--apollo-debug", action="store_true", help="Print Apollo API diagnostics to stderr.")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv)
     if not any(getattr(args, field, None) for field in ("event_id", "customer", "domain", "email", "window", "contact", "company")):
@@ -167,16 +184,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def prep_input_from_args(args: argparse.Namespace) -> PrepInput:
+    _user_urls: list[str] = list(getattr(args, "urls", None) or [])
     if args.contact or args.company:
-        return PrepInput(mode="contact-company", value=args.company or args.domain or args.contact, window=None, contact=args.contact or args.customer, company=args.company, domain=args.domain)
+        return PrepInput(mode="contact-company", value=args.company or args.domain or args.contact, window=None, contact=args.contact or args.customer, company=args.company, domain=args.domain, user_urls=_user_urls)
     if args.customer and args.domain:
-        return PrepInput(mode="contact-company", value=args.company or args.domain, window=None, contact=args.customer, company=args.company, domain=args.domain)
+        return PrepInput(mode="contact-company", value=args.company or args.domain, window=None, contact=args.customer, company=args.company, domain=args.domain, user_urls=_user_urls)
     if args.domain:
-        return PrepInput(mode="domain", value=args.domain, window=None, domain=args.domain)
+        return PrepInput(mode="domain", value=args.domain, window=None, domain=args.domain, user_urls=_user_urls)
     for mode in ("event_id", "customer", "email", "window"):
         value = getattr(args, mode)
         if value:
-            return PrepInput(mode=mode.replace("_", "-"), value=value, window=value if mode == "window" else None)
+            return PrepInput(mode=mode.replace("_", "-"), value=value, window=value if mode == "window" else None, user_urls=_user_urls)
     raise PrepError("No input mode supplied.")
 
 
@@ -252,6 +270,114 @@ def load_industry_playbook(name: str | None = None, debug: bool = False) -> dict
         return {"name": "default", "display_name": "Default / Unknown", "path": path.as_posix(), "sections": {}, "raw": ""}
 
 
+KEYWORD_DISPLAY_MAP: dict[str, str] = {
+    "음반": "music/record production",
+    "연예": "entertainment",
+    "매니지먼트": "management",
+    "아티스트": "artists",
+}
+
+COUNTRY_ADJECTIVES: dict[str, str] = {
+    "south korea": "Korean", "korea": "Korean",
+    "japan": "Japanese",
+    "china": "Chinese", "people's republic of china": "Chinese",
+    "taiwan": "Taiwanese",
+    "thailand": "Thai",
+    "vietnam": "Vietnamese",
+    "indonesia": "Indonesian",
+    "malaysia": "Malaysian",
+    "singapore": "Singaporean",
+    "india": "Indian",
+    "brazil": "Brazilian",
+}
+
+
+def _is_substantially_non_latin(text: str) -> bool:
+    """Return True if >30% of alphabetic characters are outside the Latin script (U+0000–U+024F)."""
+    if not text:
+        return False
+    alpha_chars = [ch for ch in text if ch.isalpha()]
+    if len(alpha_chars) < 4:
+        return False
+    non_latin = sum(1 for ch in alpha_chars if ord(ch) > 0x024F)
+    return non_latin / len(alpha_chars) > 0.30
+
+
+def _build_english_apollo_description(org: dict) -> str:
+    """Construct a concise English description from Apollo org metadata fields."""
+    country = str(org.get("hq_country") or org.get("country") or "").strip()
+    country_adj = COUNTRY_ADJECTIVES.get(country.lower(), country if country else "")
+    industry = str(org.get("industry") or "").strip()
+    keywords_raw = list(org.get("keywords") or [])
+    desc_raw = str(org.get("short_description") or "")
+    for kw, en_label in KEYWORD_DISPLAY_MAP.items():
+        if kw in desc_raw and en_label not in keywords_raw:
+            keywords_raw.append(en_label)
+    keywords = [
+        str(kw).strip() for kw in keywords_raw[:6]
+        if kw and not _is_substantially_non_latin(str(kw).strip())
+    ]
+    name = str(org.get("name") or "").strip()
+    kw_text = " and ".join(keywords[:2]) if keywords else ""
+    parts = [p for p in [country_adj, industry] if p]
+    prefix = " ".join(parts)
+    if prefix and kw_text:
+        return f"{prefix} company focused on {kw_text}."
+    if prefix:
+        return f"{prefix} company."
+    if name and kw_text:
+        return f"{name} focused on {kw_text}."
+    if name and industry:
+        return f"{name}: {industry} company."
+    return "Company details available via Apollo — validate before the meeting."
+
+
+def _summarize_description(desc: str, max_sentences: int = 2) -> str:
+    """Trim a long description to the first `max_sentences` sentences for user-facing fields."""
+    desc = desc.strip()
+    if len(desc) <= 220:
+        return desc
+    parts = re.split(r"(?<=[.!?])\s+", desc)
+    if len(parts) <= max_sentences:
+        return desc
+    summary = " ".join(parts[:max_sentences])
+    if not summary.endswith((".", "!", "?")):
+        summary += "."
+    return summary
+
+
+_CURRENCY_SYMBOLS: dict[str, str] = {"USD": "$", "EUR": "€", "GBP": "£", "CNY": "¥", "JPY": "¥", "KRW": "₩"}
+
+
+def _format_apollo_revenue(value: Any, currency: str | None = None) -> str:
+    """Format an Apollo revenue value into a human-readable string.
+
+    Examples: 1065000000.0 + "USD" -> "~$1.1B annual revenue signal"
+              50000000.0  + None   -> "~50M annual revenue signal (currency not confirmed)"
+    """
+    raw = str(value or "").strip().replace(",", "")
+    if not raw:
+        return ""
+    try:
+        num = float(raw.lstrip("$£€¥₩").strip())
+    except (ValueError, TypeError):
+        return raw
+    if num >= 1e9:
+        number_str = f"{num / 1e9:.1f}B"
+    elif num >= 1e6:
+        number_str = f"{num / 1e6:.0f}M"
+    elif num >= 1e3:
+        number_str = f"{num / 1e3:.0f}K"
+    else:
+        number_str = str(int(num))
+    symbol = _CURRENCY_SYMBOLS.get((currency or "").upper(), "")
+    if symbol:
+        return f"~{symbol}{number_str} annual revenue signal"
+    if currency:
+        return f"~{number_str} {currency.upper()} annual revenue signal"
+    return f"~{number_str} annual revenue signal (currency not confirmed)"
+
+
 VERTICAL_KEYWORDS: dict[str, tuple[str, ...]] = {
     "marketing_adtech": (
         "intent marketing",
@@ -277,6 +403,33 @@ VERTICAL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "conversion lift",
         "lead quality",
         "acquisition workflow",
+        "digital agency",
+        "digital marketing",
+        "creative agency",
+        "creative production",
+        "content creation",
+        "advertising agency",
+        "marketing agency",
+        "content production",
+        "digital transformation",
+        "marketing technology",
+        "ai-powered marketing",
+        "creative partner",
+        "content marketing",
+        "marketing automation",
+        "campaign management",
+        "data-driven marketing",
+        "programmatic",
+        "digital advertising",
+        "digital-first marketing",
+        "s4 capital",
+        "s4capital",
+        "technology services and consulting",
+        "data and measurement",
+        "marketing and technology services",
+        "marketing technology services",
+        "creative technology",
+        "campaign creative",
     ),
     "ai_video_creative": (
         "ai video",
@@ -292,6 +445,10 @@ VERTICAL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "creator tool",
         "batch generation",
         "generative creative",
+        "creative platform",
+        "ai-driven imagery",
+        "ai-powered image",
+        "generative image",
     ),
     "enterprise_llm": (
         "llm",
@@ -323,11 +480,19 @@ VERTICAL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "shopping",
         "merchant",
         "product image",
+        "product imagery",
         "catalog",
         "livestream commerce",
         "review analysis",
         "product search",
         "product discovery",
+        "fashion brand",
+        "retail brand",
+        "beauty brand",
+        "product photography",
+        "model imagery",
+        "virtual try-on",
+        "visual commerce",
     ),
     "gaming": (
         "game",
@@ -356,15 +521,28 @@ VERTICAL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "studio",
         "broadcasters",
         "streamers",
+        "entertainment",
+        "music",
+        "artist management",
+        "record production",
+        "talent management",
+        "music label",
+        "record label",
+        "music production",
+        "음반",
+        "연예",
+        "매니지먼트",
+        "아티스트",
     ),
     "consumer_technology": (
         "consumer devices",
-        "global technology company",
+        "consumer electronics",
         "iphone",
         "mac",
         "ipad",
         "app store",
-        "software services",
+        "hardware revenue",
+        "device ecosystem",
     ),
     "enterprise_software": (
         "enterprise software",
@@ -398,6 +576,37 @@ def evidence_snippets(context: PrepContext) -> list[str]:
         text = " ".join(str(result.get(k, "")) for k in ("title", "snippet", "url"))
         if text.strip():
             snippets.append(f"Web: {text[:220]}")
+    # Include raw page text from explicit user-provided URL pages so keyword matching
+    # sees the full startup-profile / homepage content, not just the normalized snippet.
+    for page in (enrichment.get("page_evidence") or [])[:4]:
+        if page.get("source") == "explicit_user_url":
+            raw_text = (page.get("text") or "").strip()
+            if raw_text:
+                snippets.append(f"ExplicitURL: {raw_text[:400]}")
+    apollo = context.apollo_enrichment or {}
+    apollo_org = apollo.get("organization") or {}
+    if apollo_org.get("short_description"):
+        snippets.append(f"Apollo: {str(apollo_org['short_description'])[:220]}")
+    if apollo_org.get("industry"):
+        snippets.append(f"Apollo industry: {apollo_org['industry']}")
+    for kw in (apollo_org.get("keywords") or [])[:5]:
+        snippets.append(f"Apollo keyword: {kw}")
+    city = apollo_org.get("hq_city") or apollo_org.get("city")
+    country = apollo_org.get("hq_country") or apollo_org.get("country")
+    state = apollo_org.get("hq_state") or apollo_org.get("state")
+    location_parts = [p for p in [city, state, country] if p]
+    if location_parts:
+        snippets.append(f"Apollo location: {', '.join(str(p) for p in location_parts)}")
+    emp = apollo_org.get("num_employees") or apollo_org.get("employee_count")
+    if emp:
+        snippets.append(f"Apollo employees: {emp}")
+    for tech in (apollo_org.get("technologies") or apollo_org.get("technology_names") or [])[:5]:
+        tech_name = tech if isinstance(tech, str) else (tech.get("name") or "")
+        if tech_name:
+            snippets.append(f"Apollo tech: {tech_name}")
+    linkedin = apollo_org.get("linkedin_url")
+    if linkedin:
+        snippets.append(f"Apollo linkedin: {linkedin}")
     return snippets
 
 
@@ -418,13 +627,14 @@ def infer_vertical(context: PrepContext, explicit_industry: str | None = None) -
     best, matches = max(scores.items(), key=lambda item: len(item[1]))
     confidence = "likely" if len(set(matches)) >= 2 else "weak"
     if confidence == "weak":
-        return {"name": "default", "display_name": "Default / Unknown", "confidence": "weak", "evidence": [f"Weak signal: {matches[0]}"]}
+        weak_label = KEYWORD_DISPLAY_MAP.get(matches[0], matches[0])
+        return {"name": "default", "display_name": "Default / Unknown", "confidence": "weak", "evidence": [f"Weak signal: {weak_label}"]}
     playbook = load_industry_playbook(best)
     return {
         "name": best,
         "display_name": VERTICAL_DISPLAY_NAMES.get(best) or playbook["display_name"],
         "confidence": confidence,
-        "evidence": [f"Matched signal: {item}" for item in sorted(set(matches))[:5]],
+        "evidence": [f"Matched signal: {KEYWORD_DISPLAY_MAP.get(item, item)}" for item in sorted(set(matches))[:5]],
     }
 
 
@@ -469,7 +679,7 @@ BROAD_VERTICAL_INDUSTRIES = {"marketing_adtech", "ecommerce", "gaming", "enterpr
 VERTICAL_SUBTYPE_TEMPLATES: dict[str, dict[str, str]] = {
     "agency_marketing_services": {
         "display_name": "Marketing / AdTech / Agency Holding Company",
-        "target_users": "global brands, advertisers, enterprise marketing teams, media buyers, and agency clients",
+        "target_users": "global brands, advertisers, enterprise marketing teams, creative teams, media buyers, agency clients, and marketing operations teams",
         "business_model": "advertising, marketing services, media planning/buying, creative services, communications, data/technology-enabled marketing, and agency network services",
     },
     "intent_marketing_comparison": {
@@ -500,19 +710,26 @@ def infer_vertical_subtype(text: str, vertical_name: str | None = None, explicit
     explicit = industry_slug(explicit_industry or "")
     if explicit == "ai_video_creative":
         return {"name": "creative_platform", **VERTICAL_SUBTYPE_TEMPLATES["creative_platform"], "confidence": "confirmed"}
+    _agency_terms = (
+        "global advertising", "marketing services", "agency network", "agency networks", "media buying",
+        "brand marketing", "creative services", "communications agency", "advertising and marketing",
+        "digital advertising", "digital-first marketing", "marketing and technology", "marketing technology services",
+        "s4 capital", "s4capital", "technology services and consulting", "data and measurement",
+        "creative technology", "campaign creative", "digital agency", "marketing agency", "advertising agency",
+    )
     if explicit == "marketing_adtech" or vertical_name == "marketing_adtech":
         if any(term in lowered for term in ("intent marketing", "comparison platform", "comparison platforms", "lead generation", "affiliate", "referral", "purchase decisions", "customer acquisition platform", "performance marketing platform")):
             return {"name": "intent_marketing_comparison", **VERTICAL_SUBTYPE_TEMPLATES["intent_marketing_comparison"], "confidence": "likely"}
-        if any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing", "creative services", "communications agency", "advertising and marketing")):
+        if any(term in lowered for term in _agency_terms):
             return {"name": "agency_marketing_services", **VERTICAL_SUBTYPE_TEMPLATES["agency_marketing_services"], "confidence": "likely"}
         return {"name": "unknown", "display_name": "Unknown", "target_users": "", "business_model": "", "confidence": "unknown"}
     if any(term in lowered for term in ("media and entertainment", "broadcasting", "streaming service", "tv channel", "news company", "content distribution", "format licensing", "global distribution", "production arm", "content buyers", "broadcasters", "streamers")):
         return {"name": "media_entertainment_content", **VERTICAL_SUBTYPE_TEMPLATES["media_entertainment_content"], "confidence": "likely"}
-    if any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv", "consumer devices", "app store ecosystem")):
+    if any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv", "consumer devices", "app store ecosystem", "consumer electronics", "hardware revenue")):
         return {"name": "consumer_technology", **VERTICAL_SUBTYPE_TEMPLATES["consumer_technology"], "confidence": "likely"}
     if any(term in lowered for term in ("creative platform", "stock assets", "templates", "design assets", "design platform", "ai-enabled image", "ai image", "ai video", "image generation", "video generation")):
         return {"name": "creative_platform", **VERTICAL_SUBTYPE_TEMPLATES["creative_platform"], "confidence": "likely"}
-    if any(term in lowered for term in ("global advertising", "marketing services", "agency network", "agency networks", "media buying", "brand marketing", "creative services", "communications agency")):
+    if any(term in lowered for term in _agency_terms):
         return {"name": "agency_marketing_services", **VERTICAL_SUBTYPE_TEMPLATES["agency_marketing_services"], "confidence": "likely"}
     if any(term in lowered for term in ("intent marketing", "comparison platform", "comparison platforms", "lead generation", "affiliate", "referral", "purchase decisions", "customer acquisition platform", "performance marketing platform")):
         return {"name": "intent_marketing_comparison", **VERTICAL_SUBTYPE_TEMPLATES["intent_marketing_comparison"], "confidence": "likely"}
@@ -581,24 +798,28 @@ def workload_is_active(confidence_layers: dict[str, str]) -> bool:
     return confidence_layers.get("active_workload_confidence") in {"likely", "confirmed"}
 
 
-def build_question_prefill(context: PrepContext, vertical: dict[str, Any], confidence_layers: dict[str, str] | None = None) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+def build_question_prefill(context: PrepContext, vertical: dict[str, Any], confidence_layers: dict[str, str] | None = None, description_override: str | None = None) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     enrichment = context.enrichment or {}
     known = context.known or {}
     name = vertical.get("name") or "default"
     active_workload = workload_is_active(confidence_layers or {})
     source = first_source_label(context)
     evidence = [source] if source else []
-    company_desc = enrichment.get("description") or "customer/company context"
+    company_desc = description_override or enrichment.get("description") or "customer/company context"
     use_cases = enrichment.get("known_use_cases") or []
     product_fit = enrichment.get("possible_byteplus_fit") or []
     fit_text = "; ".join(f"{item.get('product')}: {item.get('reason')}" for item in product_fit[:3] if item.get("product")) or "Ark / model platform; creative models if workload confirms"
 
+    # company_desc may come from description_override (Apollo) even when context.enrichment is empty
+    _has_desc = bool(company_desc and company_desc != "customer/company context")
+    _desc_confidence = "known" if (_has_desc and enrichment.get("description")) else ("likely" if _has_desc else "to_validate")
+    _desc_answer = (f"Likely: {company_desc} (?)" if _desc_confidence == "likely" else f"Known: {company_desc}") if _has_desc else "To Validate: core business and target users."
     common = [
         question_item(
             "Standard Discovery Questions",
             "Core business and focus group/user introduction",
-            f"Known: {company_desc}" if evidence and enrichment.get("description") else "To Validate: core business and target users.",
-            "known" if evidence and enrichment.get("description") else "to_validate",
+            _desc_answer,
+            _desc_confidence,
             "Can you confirm the exact product line, target users, and meeting scope?",
             "Anchors the pitch, use case, stakeholders, and relevant BytePlus products.",
             evidence,
@@ -697,6 +918,73 @@ def build_question_prefill(context: PrepContext, vertical: dict[str, Any], confi
             question_item("Vendor & Competitor Understanding", "Current vendors?", "Not Found.", "not_found", "Are you using Fal, Replicate, Runway, Pika, Kling, Luma, Midjourney, Stable Diffusion, or OpenAI?", "Defines replacement or augmentation angle."),
         ]
         omitted = ["Heavy LLM token questions collapsed unless text workflow evidence appears.", "Adtech traffic questions omitted unless acquisition evidence appears."]
+    elif name == "consumer_technology" and not active_workload:
+        vertical_items = [
+            question_item(
+                "Standard Discovery Questions",
+                "Which team is this discussion for?",
+                "To Validate: team scope (product, developer platform, AI/ML, marketing, content, or operations) not confirmed.",
+                "to_validate",
+                "Which team is this discussion for: product, developer platform, AI/ML, marketing, content, or operations?",
+                "Determines whether to position Ark, VLM/OCR, or Seedream/Seedance.",
+                evidence,
+            ),
+            question_item(
+                "Standard Discovery Questions",
+                "What is the priority use case?",
+                "To Validate: confirm whether priority is internal AI tooling, model/API infrastructure, multimodal understanding, or creative/product marketing.",
+                "to_validate",
+                "Is the priority internal AI tooling, model/API infrastructure, multimodal understanding, or creative/product marketing workflows?",
+                "Maps the discussion to the right BytePlus product and approach.",
+                evidence,
+            ),
+            question_item(
+                "AI Usage & Current Stack",
+                "Current model/vendor stack?",
+                "To Validate: current model stack or internal platform not confirmed.",
+                "to_validate",
+                "What current model/vendor stack or internal platform is being evaluated?",
+                "Identifies whether BytePlus is replacing, supplementing, or integrating with an existing stack.",
+            ),
+            question_item(
+                "POC Qualification",
+                "What success metric matters most?",
+                "To Validate: success metric, evaluator, benchmark method, and timeline are not confirmed.",
+                "to_validate",
+                "What success metric matters most: quality, latency, privacy/compliance, cost, developer productivity, or launch readiness?",
+                "Turns a broad discovery call into an actionable next step.",
+            ),
+        ]
+        omitted = ["Product-specific deep-dive questions collapsed until team scope and active workload are confirmed."]
+    elif name == "consumer_technology":
+        vertical_items = [
+            question_item(
+                "Standard Discovery Questions",
+                "Which team and use case?",
+                "To Validate: confirm team scope and priority use case before deep product questions.",
+                "to_validate",
+                "Which team is this for and what active AI workload should we focus on?",
+                "Anchors product positioning to the confirmed team scope.",
+                evidence,
+            ),
+            question_item(
+                "AI Usage & Current Stack",
+                "Current model/vendor stack?",
+                "Not Found.",
+                "not_found",
+                "What model/vendor stack or internal platform is currently in use or being evaluated?",
+                "Identifies replacement, augmentation, or integration opportunity.",
+            ),
+            question_item(
+                "POC Qualification",
+                "What success metric matters most?",
+                "To Validate: success metric not confirmed.",
+                "to_validate",
+                "What metric would make the POC worthwhile: quality, latency, privacy/compliance, cost, developer productivity, or launch readiness?",
+                "Converts discovery into a scoped next step.",
+            ),
+        ]
+        omitted = ["Deep product-specific questions require confirmed team scope and active workload."]
     elif name == "enterprise_llm":
         vertical_items = [
             question_item("AI Usage & Current Stack", "What AI capabilities are already integrated today?", "To Validate: current AI capabilities and production scope are not confirmed.", "to_validate", "Which workflows are in production: chat, RAG, agents, routing/evaluation, or fine-tuning?", "Clarifies Ark platform fit."),
@@ -1417,11 +1705,22 @@ def confirmed_domain_match(url_or_host: str, confirmed_domain: str | None = None
 
 def official_source(url: str, company_name: str | None = None, confirmed_domain: str | None = None) -> bool:
     host = urlparse(url).netloc.lower().removeprefix("www.")
-    return bool(
+    matched = bool(
         likely_official_web_result({"url": url}, company_name)
         or verified_related_domain(host, company_name)
         or confirmed_domain_match(url, confirmed_domain)
     )
+    if not matched:
+        return False
+    # When a confirmed domain is set and the URL does not match it, a "likely official"
+    # hit based purely on the company name appearing as a substring in the host
+    # (e.g. "monks" inside "sportmonks.com") is a false positive — reject it.
+    if confirmed_domain and not confirmed_domain_match(url, confirmed_domain):
+        compact_name = re.sub(r"[^a-z0-9]", "", (company_name or "").lower())
+        compact_host = re.sub(r"[^a-z0-9]", "", host)
+        if compact_name and len(compact_name) >= 3 and compact_name in compact_host:
+            return False
+    return True
 
 
 def blocked_as_company_website(host: str) -> bool:
@@ -1600,8 +1899,10 @@ def source_tier(url: str, company_name: str | None = None, confirmed_domain: str
         return 1, "Tier 1 - official company site"
     if any(item in host for item in ("larkoffice.com", "feishu.cn")):
         return 2, "Tier 2 - internal Lark source"
-    if any(item in host for item in ("crunchbase.com", "producthunt.com", "linkedin.com")):
-        return 3, "Tier 3 - business directory/social profile"
+    if any(item in host for item in ("crunchbase.com", "producthunt.com", "linkedin.com",
+                                     "thehub.io", "wellfound.com", "angel.co", "tracxn.com",
+                                     "pitchbook.com", "f6s.com")):
+        return 3, "Tier 3 - public startup/company profile"
     return 4, "Tier 4 - public web/news/review"
 
 
@@ -1623,10 +1924,56 @@ def fetch_page_text(url: str, debug: bool = False) -> tuple[str, str | None]:
     return text[:20000], None
 
 
-def collect_page_evidence(results: list[dict[str, str]], company_name: str | None, debug: bool = False) -> list[dict[str, Any]]:
+def fetch_explicit_user_urls(
+    urls: list[str],
+    company_name: str | None,
+    confirmed_domain: str | None = None,
+    debug: bool = False,
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Fetch user-provided URLs directly as enrichment evidence.
+
+    Returns (results, pages) in the same shape as collect_official_domain_overview so the
+    caller can use them interchangeably with the standard domain-overview path.
+    """
+    results: list[dict[str, str]] = []
+    pages: list[dict[str, Any]] = []
+    for raw_url in urls[:6]:
+        url = raw_url.strip()
+        if not url:
+            continue
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+        text, warning = fetch_page_text(url, debug=debug)
+        snippet = clean_overview_snippet(text, company_name) if text else ""
+        tier, tier_label = source_tier(url, company_name, confirmed_domain)
+        page: dict[str, Any] = {
+            "title": clean_source_label(url, url),
+            "url": url,
+            "snippet": snippet or (text[:500] if text else ""),
+            "text": text or "",
+            "fetch_warning": warning or "",
+            "tier": tier,
+            "tier_label": tier_label,
+            "source": "explicit_user_url",
+        }
+        pages.append(page)
+        if snippet or text:
+            results.append({
+                "title": clean_source_label(url, url),
+                "url": url,
+                "snippet": snippet or text[:300],
+                "source": "explicit_user_url",
+            })
+            debug_log(debug, f"explicit URL enrichment: fetched {url} (tier={tier_label}, snippet={bool(snippet)})")
+        else:
+            debug_log(debug, f"explicit URL enrichment: no content from {url} (warning={warning})")
+    return results, pages
+
+
+def collect_page_evidence(results: list[dict[str, str]], company_name: str | None, confirmed_domain: str | None = None, debug: bool = False) -> list[dict[str, Any]]:
     pages: list[dict[str, Any]] = []
     selected: list[dict[str, str]] = []
-    official = [item for item in results if likely_official_web_result(item, company_name)]
+    official = [item for item in results if official_source(item.get("url", ""), company_name, confirmed_domain)]
     selected.extend(official[:2])
     for item in results:
         url = item.get("url", "")
@@ -1724,7 +2071,7 @@ def normalize_company_overview(text: str, company_name: str | None = None) -> st
     company = company_name or "The company"
     if contains_placeholder(compact):
         return ""
-    if any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv", "consumer devices")):
+    if any(term in lowered for term in ("iphone", "mac", "ipad", "apple watch", "airpods", "apple tv")):
         if overview_quality_issue(compact, company_name):
             return f"{company} is a global technology company offering consumer devices, software, services, entertainment, accessories, and support across major product and ecosystem categories."
         return compact
@@ -1812,6 +2159,8 @@ def customer_related_pricing_text(company_name: str | None, enrichment_descripti
         haystack = f"{item.get('title', '')} {item.get('snippet', '')} {url}".lower()
         if company_name and not official_source(url, company_name, confirmed_domain) and company_name.lower() not in haystack:
             continue
+        if company_name and not is_canonical_entity_compatible(url, item.get("title", ""), item.get("snippet", ""), company_name, confirmed_domain):
+            continue
         parts.append(f"{item.get('title', '')} {item.get('snippet', '')}")
     for page in pages:
         url = page.get("url", "")
@@ -1822,6 +2171,8 @@ def customer_related_pricing_text(company_name: str | None, enrichment_descripti
             continue
         haystack = f"{page.get('title', '')} {page.get('snippet', '')} {url}".lower()
         if company_name and not official_source(url, company_name, confirmed_domain) and company_name.lower() not in haystack:
+            continue
+        if company_name and not is_canonical_entity_compatible(url, page.get("title", ""), page.get("snippet", ""), company_name, confirmed_domain):
             continue
         parts.append(page.get("text", ""))
     return " ".join(parts)
@@ -1840,6 +2191,81 @@ def contact_company_noise(url: str, title: str, snippet: str, company_name: str 
     if len(contact_parts) >= 2 and contact_parts[-1] in text and company_name.lower() in text and not official_source(url, company_name):
         return True
     return False
+
+
+def is_canonical_entity_compatible(url: str, title: str, snippet: str, company_name: str | None, confirmed_domain: str | None) -> bool:
+    """Return False when a result references a same-name-but-different-entity source.
+
+    When confirmed_domain is set, a URL host that *contains* the compact company
+    name as a substring (e.g. sportmonks.com ⊃ "monks") but does NOT match the
+    confirmed domain is a different entity and should be rejected.
+
+    Financial instrument contamination (investment trust, stock ticker) is rejected
+    even on neutral news domains, because "Monks Investment Trust (MNKS:LSE)" is a
+    legally distinct entity from Monks / monks.com.
+    """
+    if not company_name:
+        return True
+    if confirmed_domain_match(url, confirmed_domain):
+        return True
+
+    combined_text = f"{title} {snippet}".lower()
+
+    # Reject financial-instrument contamination: investment trust, ticker symbols, NAV/fund pages.
+    # These are legally distinct entities that share a similar name with the operating company.
+    _FINANCIAL_ENTITY_MARKERS = (
+        "investment trust", "investment fund", "net asset value", " nav ",
+        "fund manager", " aum ", "portfolio companies", "listed investment",
+    )
+    _TICKER_EXCHANGE_RE = re.compile(r'\b[A-Z]{2,6}:(LSE|NYSE|NASDAQ|HKEX|SGX|TSX|ASX)\b')
+    if confirmed_domain:
+        compact_name_fin = re.sub(r"[^a-z0-9]", "", company_name.lower())
+        if compact_name_fin and len(compact_name_fin) >= 3 and compact_name_fin in combined_text:
+            if any(marker in combined_text for marker in _FINANCIAL_ENTITY_MARKERS):
+                return False
+            if _TICKER_EXCHANGE_RE.search(f"{title} {snippet}"):
+                return False
+
+    neutral_hosts = (
+        "wikipedia.org", "linkedin.com", "crunchbase.com", "bloomberg.com",
+        "reuters.com", "techcrunch.com", "forbes.com", "ft.com", "wsj.com",
+        "businessinsider.com", "wired.com", "theregister.com", "venturebeat.com",
+        "nytimes.com", "bbc.com", "theguardian.com", "apnews.com",
+        "pitchbook.com", "cbinsights.com", "glassdoor.com", "g2.com",
+    )
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if any(nh in host for nh in neutral_hosts):
+        return True
+    compact_name = re.sub(r"[^a-z0-9]", "", company_name.lower())
+    compact_host = re.sub(r"[^a-z0-9]", "", host)
+    if not compact_name or len(compact_name) < 3:
+        return True
+    # Common rejection helper — used for both host and path matches
+    def _reject_unless_canonical_cited() -> bool:
+        canonical_bare = (confirmed_domain or "").lower().split(":")[0].removeprefix("www.").split("/")[0]
+        if canonical_bare and canonical_bare in combined_text:
+            return False  # allow: snippet cites the canonical domain
+        return True  # reject
+
+    # Reject if the company name appears embedded in a different host name
+    # but that host does not match the confirmed domain.  For example:
+    #   company="Monks", confirmed_domain="monks.com", url host="sportmonks.com"
+    #   → compact_name="monks" in compact_host="sportmonks" → reject
+    if compact_name in compact_host and confirmed_domain and not confirmed_domain_match(url, confirmed_domain):
+        if _reject_unless_canonical_cited():
+            return False
+
+    # Also reject if the company name appears as a path segment on a different host.
+    # For example: https://sportsapi.com/monks — "monks" is a path segment on sportsapi.com.
+    if confirmed_domain and not confirmed_domain_match(url, confirmed_domain):
+        compact_path = re.sub(r"[^a-z0-9/]", "", (parsed.path or "").lower())
+        path_segments = [seg for seg in compact_path.split("/") if seg]
+        if compact_name in path_segments:
+            if _reject_unless_canonical_cited():
+                return False
+
+    return True
 
 
 def classify_source(url: str, title: str = "", snippet: str = "", company_name: str | None = None, customer_name: str | None = None, candidate_company: str | None = None, confirmed_domain: str | None = None, contact_name: str | None = None) -> str:
@@ -1862,6 +2288,9 @@ def classify_source(url: str, title: str = "", snippet: str = "", company_name: 
     if "pricing" in text and not official_source(url, company_name, confirmed_domain):
         return "generic_market_reference"
     if company_name and company_name.lower() in text:
+        # Guard: reject same-name-different-entity sources when a confirmed domain is set
+        if confirmed_domain and not is_canonical_entity_compatible(url, title, snippet, company_name, confirmed_domain):
+            return "generic_market_reference"
         return "customer_evidence"
     candidate_terms = [term.lower() for term in [candidate_company or "", customer_name or ""] if term]
     if any(term and term in text for term in candidate_terms):
@@ -1906,11 +2335,23 @@ def extract_company_dossier(
     confirmed_domain: str | None = None,
     contact_name: str | None = None,
 ) -> dict[str, Any]:
+    compatible_web_results = [
+        item for item in web_results
+        if is_canonical_entity_compatible(item.get("url", ""), item.get("title", ""), item.get("snippet", ""), company_name, confirmed_domain)
+    ]
+    compatible_pages = [
+        page for page in pages
+        if is_canonical_entity_compatible(
+            page.get("url", ""), page.get("title", ""), page.get("snippet", ""),
+            company_name, confirmed_domain
+        )
+    ]
     combined = " ".join(
         [enrichment_description]
-        + [f"{item.get('title', '')} {item.get('snippet', '')}" for item in web_results]
-        + [page.get("text", "") for page in pages]
+        + [f"{item.get('title', '')} {item.get('snippet', '')}" for item in compatible_web_results]
+        + [page.get("text", "") for page in compatible_pages]
     )
+    rejected_web_count = (len(web_results) - len(compatible_web_results)) + (len(pages) - len(compatible_pages))
     modules = []
     module_signals = [
         ("Intent marketing platform", ("intent marketing", "customer acquisition")),
@@ -1953,7 +2394,7 @@ def extract_company_dossier(
         )
         if classification in {"customer_evidence", "candidate_entity_evidence"}:
             trusted_scale_parts.append(f"{item.get('title', '')} {item.get('snippet', '')}")
-    for page in pages:
+    for page in compatible_pages:
         classification = classify_source(
             page.get("url", ""),
             page.get("title", ""),
@@ -1990,11 +2431,21 @@ def extract_company_dossier(
             if signal not in scale_signals:
                 scale_signals.append(signal)
 
+    _FOUNDER_FRAGMENT_WORDS = {"the", "an", "a", "its", "our", "their", "all", "this", "that", "with", "for", "by", "at", "of", "global", "sport", "api", "data"}
+
     founders = []
     for pattern in [r"founder(?: and CEO)?\s+([A-Z][A-Za-z .'-]{2,60})", r"led by\s+([A-Z][A-Za-z .'-]{2,60})"]:
         for match in re.finditer(pattern, combined):
             value = match.group(1).strip(" .")
-            if value and value not in founders:
+            # Require at least two words (first + last name) and no fragment word
+            words = value.split()
+            if (
+                value
+                and value not in founders
+                and len(words) >= 2
+                and not any(w.lower() in _FOUNDER_FRAGMENT_WORDS for w in words)
+                and all(len(w) >= 2 for w in words)
+            ):
                 founders.append(value)
 
     hq = ""
@@ -2022,8 +2473,12 @@ def extract_company_dossier(
     traffic_source_scale = ""
     traffic_terms = []
     for term in ("seo", "sem", "affiliate", "paid social", "partner traffic", "high-intent audiences", "purchase decisions"):
-        if term in lowered:
-            traffic_terms.append(term)
+        if len(term) <= 3:
+            if re.search(r'\b' + re.escape(term) + r'\b', lowered):
+                traffic_terms.append(term)
+        else:
+            if term in lowered:
+                traffic_terms.append(term)
     if traffic_terms:
         traffic_source_scale = "; ".join(dict.fromkeys(traffic_terms))
     business_model = ""
@@ -2054,7 +2509,7 @@ def extract_company_dossier(
                 "source_classification": classification,
             }
         )
-    for page in sorted(pages[:6], key=lambda x: source_tier(x.get("url", ""), company_name, confirmed_domain)[0]):
+    for page in sorted(compatible_pages[:6], key=lambda x: source_tier(x.get("url", ""), company_name, confirmed_domain)[0]):
         classification = classify_source(
             page.get("url", ""),
             page.get("title", ""),
@@ -2108,6 +2563,7 @@ def extract_company_dossier(
             ]
             if not present
         ],
+        "rejected_web_count": rejected_web_count,
     }
 
 
@@ -2185,7 +2641,7 @@ def suggested_customer_questions(use_cases: list[str], combined_text: str) -> li
     ]
 
 
-def synthesize_known_fields(enrichment: dict[str, Any] | None, docs: list[dict[str, Any]], web_results: list[dict[str, str]]) -> dict[str, Any]:
+def synthesize_known_fields(enrichment: dict[str, Any] | None, docs: list[dict[str, Any]], web_results: list[dict[str, str]], apollo_enrichment: dict[str, Any] | None = None) -> dict[str, Any]:
     if not enrichment:
         return {}
     text = " ".join(
@@ -2215,11 +2671,381 @@ def synthesize_known_fields(enrichment: dict[str, Any] | None, docs: list[dict[s
     if dossier.get("pricing_tiers"):
         known["budget_status"] = "To Validate: public customer packaging terms were found, but actual AI infra spend, vendor commitments, budget owner, and BytePlus-relevant commitment are not confirmed."
     if dossier.get("product_modules"):
-        known["expansion_opportunity"] = "Likely product modules: " + ", ".join(dossier["product_modules"][:6])
+        known["expansion_opportunity"] = "Possible product modules: " + ", ".join(dossier["product_modules"][:6])
     return known
 
 
+def generate_byteplus_fit_hypotheses(
+    vertical: str,
+    description: str = "",
+    tech_signals: list[str] | None = None,
+) -> dict[str, list]:
+    """
+    Return vertical-aware BytePlus fit hypotheses.
+    All items are framed as hypotheses to validate; no confirmed-workload claims.
+    Returns {"known_use_cases": [...], "possible_byteplus_fit": [...]} or {} for default/unknown.
+    Each possible_byteplus_fit entry has: product, reason, validation, confidence.
+    """
+    desc_lower = (description or "").lower()
+    techs = [t.lower() for t in (tech_signals or [])]
+
+    def _desc(*kw: str) -> bool:
+        return any(k in desc_lower for k in kw)
+
+    def _tech(*kw: str) -> bool:
+        return any(any(k in t for k in kw) for t in techs)
+
+    if vertical == "marketing_adtech":
+        ark_priority = _tech("ai", "openai", "bedrock", "api", "ml") or _tech("aws", "azure", "gcp")
+        fit = [
+            {
+                "product": "Seedance / Seedream",
+                "reason": "campaign creative generation, image/video ad asset production, content localization and variation, and creative testing at scale",
+                "validation": "Validate actual creative workflow, asset volume, production toolchain, and success metric.",
+                "confidence": "medium",
+            },
+            {
+                "product": "Ark / model platform",
+                "reason": "internal AI workflow, campaign assistant, model routing/evaluation, API integration, and cost/latency control for creative production pipelines",
+                "validation": "Validate current model stack, API usage pattern, ownership, and cost/latency expectations.",
+                "confidence": "medium",
+            },
+            {
+                "product": "VLM / automation",
+                "reason": "creative QA, brand safety review, asset inspection, ad compliance checking, and content moderation workflow",
+                "validation": "Validate whether visual QA or compliance is a pain point and what the current review process looks like.",
+                "confidence": "low",
+            },
+        ]
+        if ark_priority:
+            fit = [fit[1], fit[0], fit[2]]
+        return {
+            "known_use_cases": [
+                "Possible fit hypothesis to validate: campaign creative generation — image/video ad assets, creative variations, and localization at scale (?)",
+                "Possible fit hypothesis to validate: AI-powered content production pipeline — automated asset creation, brand templates, and creative testing (?)",
+                "Possible fit hypothesis to validate: AI workflow automation — internal creative review, brand safety QA, and asset inspection (?)",
+            ],
+            "possible_byteplus_fit": fit,
+        }
+
+    if vertical == "media_entertainment":
+        has_music = _desc("music", "record", "artist", "album", "음반", "연예")
+        has_film = _desc("film", "movie", "streaming", "cinema", "broadcast")
+        if has_music:
+            seedance_reason = "artist promo videos, teaser content, short-form fan engagement clips, MV/storyboard exploration, and social video production"
+            seedream_reason = "poster/key visual generation, concept art, artist visual assets, album/campaign creatives, and image editing"
+        elif has_film:
+            seedance_reason = "promo trailers, teaser content, short-form social video production, and scene/storyboard exploration"
+            seedream_reason = "poster/key visual generation, concept art, promotional creatives, and image editing"
+        else:
+            seedance_reason = "promo video generation, teaser content, short-form social video production, and visual storytelling"
+            seedream_reason = "poster/key visual generation, concept art, campaign creatives, and image editing"
+        return {
+            "known_use_cases": [
+                "Possible fit hypothesis to validate: AI-generated visual content for promotional content, visuals, and social media assets (?)",
+                "Possible fit hypothesis to validate: AI workflow automation for content review, asset management, and localization (?)",
+            ],
+            "possible_byteplus_fit": [
+                {
+                    "product": "Seedance",
+                    "reason": seedance_reason,
+                    "validation": "Validate content production volume, social video workflow, and creative toolchain.",
+                    "confidence": "medium",
+                },
+                {
+                    "product": "Seedream",
+                    "reason": seedream_reason,
+                    "validation": "Validate image/visual asset production workflow and design team tooling.",
+                    "confidence": "medium",
+                },
+                {
+                    "product": "Ark / model platform",
+                    "reason": "content planning assistant, script/caption generation, localization, fan/community content workflows, and model API integration",
+                    "validation": "Validate current AI stack, content planning tools, and API integration needs.",
+                    "confidence": "medium",
+                },
+                {
+                    "product": "VLM / automation",
+                    "reason": "content review, visual asset tagging, video understanding, brand/safety checks, and catalog/search automation",
+                    "validation": "Validate whether content QA or catalog automation is a pain point.",
+                    "confidence": "low",
+                },
+            ],
+        }
+
+    if vertical == "ecommerce":
+        return {
+            "known_use_cases": [
+                "Possible fit hypothesis to validate: product image generation/editing, background replacement, and SKU visual variation at scale (?)",
+                "Possible fit hypothesis to validate: AI-powered shopping assistant, product copy generation, and recommendation/search automation (?)",
+            ],
+            "possible_byteplus_fit": [
+                {
+                    "product": "Seedream",
+                    "reason": "product image generation/editing, background replacement, SKU visual variation, and localized product creatives",
+                    "validation": "Validate product catalog size, image production volume, and current creative toolchain.",
+                    "confidence": "medium",
+                },
+                {
+                    "product": "Seedance",
+                    "reason": "short product videos, ad creatives, livestream/product demo clips, and social commerce video assets",
+                    "validation": "Validate whether video ads or livestream content production is a current workflow.",
+                    "confidence": "medium",
+                },
+                {
+                    "product": "Ark / model platform",
+                    "reason": "shopping assistant, product copy generation, recommendation/search assistant, and customer service automation",
+                    "validation": "Validate current AI stack, recommendation/search ownership, and conversational AI plans.",
+                    "confidence": "medium",
+                },
+                {
+                    "product": "VLM / automation",
+                    "reason": "catalog QA, product image understanding, OCR from product pages, moderation, and duplicate detection",
+                    "validation": "Validate whether catalog QA or image moderation is a current pain point.",
+                    "confidence": "low",
+                },
+            ],
+        }
+
+    if vertical == "gaming":
+        return {
+            "known_use_cases": [
+                "Possible fit hypothesis to validate: game asset generation — character/item creatives, key visuals, and store assets (?)",
+                "Possible fit hypothesis to validate: marketing creative generation — game trailer variations, promo clips, and ad creatives (?)",
+            ],
+            "possible_byteplus_fit": [
+                {
+                    "product": "Seedance",
+                    "reason": "game trailer variations, character/action promo clips, UGC-style short video ads, and cinematic previsualization",
+                    "validation": "Validate game genre, trailer production workflow, and marketing creative volume.",
+                    "confidence": "medium",
+                },
+                {
+                    "product": "Seedream",
+                    "reason": "character concept art, item/skin creatives, key visual generation, and store assets",
+                    "validation": "Validate game art pipeline, in-house vs. outsourced art production, and asset generation volume.",
+                    "confidence": "medium",
+                },
+                {
+                    "product": "Ark / model platform",
+                    "reason": "NPC/dialogue assistant, player support, localization, community moderation, and model routing",
+                    "validation": "Validate current AI usage in-game or live-ops, support automation needs, and model stack.",
+                    "confidence": "medium",
+                },
+                {
+                    "product": "VLM / automation",
+                    "reason": "gameplay video understanding, content moderation, ad creative QA, and bug/visual issue triage",
+                    "validation": "Validate whether content moderation or QA automation is a current pain point.",
+                    "confidence": "low",
+                },
+            ],
+        }
+
+    if vertical == "ai_video_creative":
+        ark_priority = _tech("api", "openai", "bedrock", "ml", "aws", "azure", "gcp") or _desc("platform", "developer", "api")
+        fit = [
+            {
+                "product": "Seedance",
+                "reason": "model comparison, video generation capacity, reference-based generation, creative API integration, and quality/latency benchmarking",
+                "validation": "Validate current model stack, generation volume, API integration needs, and benchmark criteria.",
+                "confidence": "medium",
+            },
+            {
+                "product": "Seedream",
+                "reason": "image-to-video pipeline assets, image editing, reference image generation, and visual consistency workflows",
+                "validation": "Validate image generation workflow, pipeline architecture, and quality benchmarks.",
+                "confidence": "medium",
+            },
+            {
+                "product": "Ark / model platform",
+                "reason": "multi-model routing, evaluation platform, model API orchestration, and cost/latency optimization",
+                "validation": "Validate model evaluation needs, routing requirements, and API scale.",
+                "confidence": "medium",
+            },
+            {
+                "product": "VLM / automation",
+                "reason": "video QA, generated-content evaluation, prompt/result inspection, and safety/quality scoring",
+                "validation": "Validate whether automated QA or safety scoring is a current workflow.",
+                "confidence": "low",
+            },
+        ]
+        if ark_priority:
+            fit = [fit[2], fit[0], fit[1], fit[3]]
+        return {
+            "known_use_cases": [
+                "Possible fit hypothesis to validate: video generation, editing, or batch production workflow (?)",
+                "Possible fit hypothesis to validate: API integration for multi-model routing, evaluation, or content production pipeline (?)",
+            ],
+            "possible_byteplus_fit": fit,
+        }
+
+    if vertical == "enterprise_llm":
+        has_creative_signal = _desc("creative", "content", "media", "image", "video")
+        fit: list[dict[str, Any]] = [
+            {
+                "product": "Ark / model platform",
+                "reason": "model gateway, routing, evaluation, observability, enterprise API integration, cost/latency optimization, and internal assistant workflows",
+                "validation": "Validate current model stack, API integration needs, evaluation requirements, and cost/latency expectations.",
+                "confidence": "medium",
+            },
+            {
+                "product": "VLM / OCR",
+                "reason": "document understanding, image/video understanding, workflow automation, and support/ops automation",
+                "validation": "Validate document processing volume, understanding requirements, and automation use cases.",
+                "confidence": "medium",
+            },
+        ]
+        if has_creative_signal:
+            fit += [
+                {
+                    "product": "Seedream",
+                    "reason": "content/image generation, visual asset production, and creative workflow automation",
+                    "validation": "Validate whether creative/image generation is a near-term workload.",
+                    "confidence": "low",
+                },
+                {
+                    "product": "Seedance",
+                    "reason": "video generation, content production, and media workflow automation",
+                    "validation": "Validate whether video generation is a near-term workload.",
+                    "confidence": "low",
+                },
+            ]
+        return {
+            "known_use_cases": [
+                "Possible fit hypothesis to validate: enterprise AI workflow automation, model API integration, and internal assistant use cases (?)",
+                "Possible fit hypothesis to validate: document/image understanding, ops automation, and workflow intelligence (?)",
+            ],
+            "possible_byteplus_fit": fit,
+        }
+
+    if vertical == "consumer_technology":
+        has_developer = _desc("developer", "platform", "ecosystem", "sdk", "api")
+        has_creative = _desc("creative", "media", "content", "advertising", "marketing", "campaign")
+        creative_note = (
+            "campaign creative generation, product visual assets, localization, short-form video, launch content, and creative variation testing"
+            " — conditional on whether the meeting is with marketing/creative/content teams"
+        )
+        fit: list[dict[str, Any]] = [
+            {
+                "product": "Ark / model platform",
+                "reason": "model routing/evaluation, internal AI assistant workflows, developer/product team API integration, inference quality/latency/cost benchmarking, and enterprise model governance",
+                "validation": "Validate which team this discussion is for (product, AI/ML, developer platform, marketing, or ops) and what the priority use case is.",
+                "confidence": "medium",
+            },
+            {
+                "product": "VLM / OCR / multimodal automation",
+                "reason": "UI screenshot understanding, device/content QA, visual inspection, accessibility/documentation workflows, support automation, and image/video understanding for product or app workflows",
+                "validation": "Validate whether UI/content QA, visual inspection, accessibility, or support automation is a current pain point.",
+                "confidence": "medium",
+            },
+            {
+                "product": "Seedream / Seedance",
+                "reason": creative_note,
+                "validation": "Confirm whether the meeting involves marketing, creative, or content teams before positioning Seedream/Seedance.",
+                "confidence": "low",
+            },
+        ]
+        return {
+            "known_use_cases": [
+                "Possible fit hypothesis to validate: model routing/evaluation, internal AI assistant, developer/product API integration, and inference benchmarking (?)",
+                "Possible fit hypothesis to validate: UI/content QA, visual inspection, accessibility automation, and multimodal understanding for product or app workflows (?)",
+                "Possible fit hypothesis to validate: creative/product-marketing assets — conditional on whether discussion is with marketing/creative teams (?)",
+            ],
+            "possible_byteplus_fit": fit,
+        }
+
+    return {}  # default/unknown — renderer uses generic fallback
+
+
+def _add_vertical_fit_from_apollo(render_json: dict[str, Any]) -> None:
+    """Add BytePlus fit hypotheses for known verticals when Apollo org enrichment is available.
+
+    Sets enrichment.available=True and enrichment.fit_source='apollo_hypothesis' so
+    the renderer bypasses the workload-confirmation gate via _is_apollo_hypothesis_fit().
+    Does NOT promote active_workload_confidence — workload remains unconfirmed.
+    """
+    vertical = render_json.get("vertical") or {}
+    vertical_name = vertical.get("name") or ""
+    apollo = render_json.get("apollo") or {}
+    if apollo.get("status") not in ("organization_matched", "partial"):
+        return
+    enrichment = render_json.get("enrichment") or {}
+    existing_use_cases = [
+        item for item in (enrichment.get("known_use_cases") or [])
+        if item and not str(item).startswith("To Validate") and not str(item).startswith("Likely fit hypothesis") and not str(item).startswith("Possible fit hypothesis")
+    ]
+    if existing_use_cases:
+        return  # web enrichment already has confirmed use cases — do not override
+    org = apollo.get("organization") or {}
+    description = org.get("short_description_en") or org.get("short_description") or ""
+    tech_signals = list(org.get("technology_names") or org.get("technologies") or [])
+    hypotheses = generate_byteplus_fit_hypotheses(vertical_name, description, tech_signals)
+    if not hypotheses:
+        return
+    enrichment["known_use_cases"] = hypotheses["known_use_cases"]
+    enrichment["possible_byteplus_fit"] = hypotheses["possible_byteplus_fit"]
+    enrichment["available"] = True
+    enrichment["fit_source"] = "apollo_hypothesis"
+    render_json["enrichment"] = enrichment
+
+
+def _build_enrichment_from_pages(
+    results: list[dict[str, str]],
+    pages: list[dict[str, Any]],
+    inferred_company: str | None,
+    customer: "CustomerIdentity",
+    source_label: str,
+    debug: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, str]], None]:
+    """Build a minimal enrichment dict from already-fetched pages (no web search)."""
+    combined = " ".join((item.get("title", "") + " " + item.get("snippet", "")).lower() for item in results)
+    use_cases = infer_use_cases(combined)
+    description = (results[0].get("snippet") or "").strip() if results else ""
+    description = stable_company_description(inferred_company, description, use_cases) if description else ""
+    website = customer.domain or ""
+    if not website:
+        for item in results:
+            h = urlparse(item.get("url", "")).netloc.lower().removeprefix("www.")
+            if h and not blocked_as_company_website(h):
+                website = stable_company_website(h)
+                break
+    dossier = extract_company_dossier(inferred_company, description, use_cases, results, pages, customer.canonical_name, customer.domain, customer.contact_name)
+    if not dossier.get("what_they_do") or str(dossier.get("what_they_do", "")).startswith("To Validate:"):
+        if description:
+            dossier["what_they_do"] = description
+    enrichment: dict[str, Any] = {
+        "available": True,
+        "confidence": "medium",
+        "website": website,
+        "company_name": inferred_company or "",
+        "description": dossier.get("what_they_do") or description,
+        "dossier": dossier,
+        "page_evidence": pages,
+        "industry": "To Validate: inferred from explicit URL sources",
+        "known_use_cases": use_cases,
+        "known_competitors": infer_competitors(combined),
+        "known_risks": ["Direct URL enrichment only; validate customer requirements, budget, timeline, and decision process"],
+        "possible_byteplus_fit": possible_byteplus_fit(use_cases, combined),
+        "suggested_questions": suggested_customer_questions(use_cases, combined),
+        "source_links": [{"label": item.get("title") or item.get("url", ""), "url": item.get("url", "")} for item in results[:3]],
+        "source": source_label,
+        "web_search_status": "explicit_url_only",
+        "company_overview_status": "usable_results_found",
+    }
+    return enrichment, results, None
+
+
 def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dict[str, Any] | None, list[dict[str, str]], str | None]:
+    if os.getenv("PREP_WEB_SEARCH_DISABLED", "0").strip() == "1":
+        debug_log(debug, "web search disabled by PREP_WEB_SEARCH_DISABLED=1")
+        # Even when web search is disabled, explicit user URLs can still be fetched.
+        if context.user_urls:
+            customer = context.customer
+            inferred_company = customer.company_name or (domain_to_name(customer.domain) if customer.domain else None) or infer_company_from_docs(customer.canonical_name, context.prior_docs)
+            eu_results, eu_pages = fetch_explicit_user_urls(context.user_urls, inferred_company, customer.domain, debug=debug)
+            if eu_results:
+                return _build_enrichment_from_pages(eu_results, eu_pages, inferred_company, customer, "explicit_user_url", debug=debug)
+        return None, [], "web_search: disabled_by_env"
     customer = context.customer
     inferred_company = customer.company_name or (domain_to_name(customer.domain) if customer.domain else None) or infer_company_from_docs(customer.canonical_name, context.prior_docs)
     direct_overview_results: list[dict[str, str]] = []
@@ -2228,6 +3054,15 @@ def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dic
     if customer.domain and inferred_company:
         direct_overview_results, direct_overview_pages, direct_overview_warning = collect_official_domain_overview(customer.domain, inferred_company, debug=debug)
     company_overview_status = "usable_results_found" if direct_overview_results else "no_overview_eligible_results"
+
+    # Pre-fetch explicit user-provided URLs (runs regardless of web search outcome).
+    user_url_results: list[dict[str, str]] = []
+    user_url_pages: list[dict[str, Any]] = []
+    if context.user_urls:
+        user_url_results, user_url_pages = fetch_explicit_user_urls(context.user_urls, inferred_company, customer.domain, debug=debug)
+        if user_url_results and not direct_overview_results:
+            company_overview_status = "usable_results_found"
+
     queries = expand_web_queries(customer, inferred_company)
     if not queries:
         return None, [], "web_search: disabled_or_not_configured"
@@ -2237,8 +3072,15 @@ def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dic
             results = direct_overview_results
             page_evidence = direct_overview_pages
             warning = None
+        elif user_url_results:
+            # Explicit user URLs are the only available source — treat like direct domain overview.
+            results = user_url_results
+            page_evidence = user_url_pages
+            warning = None
+            company_overview_status = "usable_results_found"
         elif customer.domain and inferred_company:
-            dossier = extract_company_dossier(inferred_company, "", [], [], direct_overview_pages, customer.canonical_name, customer.domain, customer.contact_name)
+            all_pages = direct_overview_pages + user_url_pages
+            dossier = extract_company_dossier(inferred_company, "", [], [], all_pages, customer.canonical_name, customer.domain, customer.contact_name)
             description = "To Validate: business description could not be enriched because web search/fetch was unavailable."
             dossier["what_they_do"] = description
             enrichment = {
@@ -2248,7 +3090,7 @@ def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dic
                 "company_name": inferred_company,
                 "description": description,
                 "dossier": dossier,
-                "page_evidence": direct_overview_pages,
+                "page_evidence": all_pages,
                 "industry": "To Validate: industry could not be enriched from available sources",
                 "known_use_cases": [],
                 "known_competitors": [],
@@ -2264,10 +3106,13 @@ def build_web_enrichment(context: PrepContext, debug: bool = False) -> tuple[dic
         else:
             return None, [], warning
     else:
-        page_evidence = direct_overview_pages + collect_page_evidence(results, inferred_company, debug=debug)
+        page_evidence = direct_overview_pages + user_url_pages + collect_page_evidence(results, inferred_company, confirmed_domain=customer.domain, debug=debug)
         if direct_overview_results:
             seen_result_urls = {item.get("url") for item in direct_overview_results}
             results = direct_overview_results + [item for item in results if item.get("url") not in seen_result_urls]
+        if user_url_results:
+            seen_result_urls = {item.get("url") for item in results}
+            results = results + [item for item in user_url_results if item.get("url") not in seen_result_urls]
     scored_results = sorted(
         ((contextual_web_score(item, customer.canonical_name, inferred_company), item) for item in results),
         key=lambda pair: pair[0],
@@ -2444,6 +3289,10 @@ def build_context(
     *,
     event: dict[str, Any] | None,
     debug: bool = False,
+    no_apollo: bool = False,
+    apollo_refresh: bool = False,
+    apollo_debug: bool = False,
+    apollo_max_people: int | None = None,
 ) -> PrepContext:
     explicit_customer = prep_input.value if prep_input.mode == "customer" else None
     explicit_domain = prep_input.domain or (prep_input.value if prep_input.mode == "domain" else None)
@@ -2476,7 +3325,29 @@ def build_context(
         missing.append(expanded_warning)
 
     context = PrepContext(identity, event, prior_docs, None, missing, docs_search_available=bool(prior_docs) or search_warning is None)
+    context.user_urls = list(prep_input.user_urls or [])
     mcp_enrichment = call_mcp_enrichment(context, debug=debug)
+
+    # Apollo enrichment: after MCP, before web search (optional, additive)
+    if _APOLLO_AVAILABLE and not no_apollo:
+        try:
+            apollo_result = _enrich_with_apollo(
+                identity,
+                prep_input=prep_input,
+                event=event,
+                vertical_name=None,  # vertical not yet inferred at this stage
+                apollo_max_people=apollo_max_people,
+                apollo_refresh=apollo_refresh,
+                debug=apollo_debug or debug,
+            )
+            context.apollo_enrichment = _apollo_result_to_dict(apollo_result)
+            if apollo_result.warnings:
+                for w in apollo_result.warnings:
+                    debug_log(debug, f"Apollo warning: {w}")
+        except Exception as exc:  # pragma: no cover - defensive
+            debug_log(debug, f"Apollo enrichment failed: {exc}")
+            context.apollo_enrichment = {"status": "request_failed", "confidence": "none"}
+
     web_enrichment, web_results, web_warning = build_web_enrichment(context, debug=debug)
     context.search_results = web_results
     context.web_search_available = bool(web_results)
@@ -2493,7 +3364,7 @@ def build_context(
     elif customer := context.customer:
         context.company_overview_status = "no_overview_eligible_results" if customer.domain else "disabled_or_not_configured"
     context.enrichment = mcp_enrichment or web_enrichment
-    context.known = synthesize_known_fields(context.enrichment, context.prior_docs, context.search_results)
+    context.known = synthesize_known_fields(context.enrichment, context.prior_docs, context.search_results, context.apollo_enrichment)
     dossier = (context.enrichment or {}).get("dossier") or {}
     if any(
         item.get("source_classification") == "customer_evidence"
@@ -2512,6 +3383,150 @@ def build_context(
     if mcp_enrichment is None:
         context.missing_context.append("MCP enrichment unavailable")
     return context
+
+
+def _augment_render_json_from_apollo(render_json: dict[str, Any], apollo: dict[str, Any]) -> None:
+    """Merge Apollo org data into dossier/enrichment fields when web enrichment is unavailable.
+
+    Non-Latin descriptions are normalized to a concise English paraphrase (stored as
+    short_description_en). Long English descriptions are summarized to ≤2 sentences.
+    The original text is preserved in apollo_desc_original so the Evidence Table can
+    show it; user-facing fields always receive the concise English version.
+    Apollo firmographic signals (employee count, revenue) go into dossier.scale_signals,
+    NOT monthly_volume (which is reserved for API/generation volume).
+    """
+    if not apollo or apollo.get("status") not in ("organization_matched", "partial"):
+        return
+    org_orig = apollo.get("organization") or {}
+    desc = str(org_orig.get("short_description") or org_orig.get("description") or "").strip()
+
+    # Normalize non-Latin descriptions to English; preserve original for evidence
+    if desc and _is_substantially_non_latin(desc):
+        english_desc = _build_english_apollo_description(org_orig)
+        original_desc: str | None = desc
+    else:
+        english_desc = desc
+        original_desc = None
+
+    # Summarize long English descriptions to 1-2 sentences for user-facing fields
+    user_facing_desc = _summarize_description(english_desc) if english_desc else ""
+
+    # Shallow-copy the org dict to annotate without mutating the original context
+    org = dict(org_orig)
+    if user_facing_desc:
+        org["short_description_en"] = user_facing_desc
+    if original_desc:
+        org["apollo_desc_original"] = original_desc
+    apollo_copy = dict(apollo)
+    apollo_copy["organization"] = org
+    render_json["apollo"] = apollo_copy
+
+    # Populate user-facing description fields only when no better source exists
+    if user_facing_desc:
+        apollo_desc_text = f"{user_facing_desc} (Apollo signal)"
+        apollo_likely_desc = f"Likely: {user_facing_desc} (Apollo signal) (?)"
+
+        enrichment = render_json.get("enrichment") or {}
+        dossier = enrichment.get("dossier") or {}
+        current_what = str(dossier.get("what_they_do") or "").strip()
+        is_exact_domain_match = apollo.get("status") == "organization_matched"
+        if is_exact_domain_match or not current_what or current_what.startswith("To Validate:"):
+            dossier["what_they_do"] = apollo_desc_text
+            dossier["what_they_do_confidence"] = "likely"
+            if is_exact_domain_match:
+                dossier["what_they_do_source"] = "apollo_exact_domain"
+            enrichment["dossier"] = dossier
+            render_json["enrichment"] = enrichment
+
+        current_edesc = str(enrichment.get("description") or "").strip()
+        if not current_edesc or current_edesc.startswith("To Validate:"):
+            enrichment["description"] = apollo_likely_desc
+            render_json["enrichment"] = enrichment
+
+        customer = render_json.get("customer") or {}
+        current_cdesc = str(customer.get("description") or "").strip()
+        if not current_cdesc or current_cdesc.startswith("To Validate:"):
+            customer["description"] = apollo_likely_desc
+            render_json["customer"] = customer
+
+        source_status = render_json.get("source_status") or {}
+        if source_status.get("company_overview_enrichment") != "usable_results_found":
+            source_status["company_overview_enrichment"] = "usable_results_found"
+            render_json["source_status"] = source_status
+
+    # Populate dossier.scale_signals AND known["scale_signal"] from Apollo firmographics.
+    # Monthly Volume is reserved for API/generation usage volume — do NOT set it here.
+    enrichment = render_json.get("enrichment") or {}
+    dossier = enrichment.get("dossier") or {}
+    scale_signals: list[str] = list(dossier.get("scale_signals") or [])
+    emp = org.get("num_employees") or org.get("employee_count")
+    if emp and not any("employee" in str(s).lower() for s in scale_signals):
+        scale_signals.append(f"~{emp:,} employees (Apollo signal)")
+    revenue = org.get("annual_revenue")
+    currency = org.get("annual_revenue_currency") or org.get("revenue_currency")
+    rev_str = ""
+    if revenue and str(revenue).strip() and not any("revenue" in str(s).lower() for s in scale_signals):
+        rev_str = _format_apollo_revenue(revenue, currency)
+        if rev_str:
+            scale_signals.append(f"{rev_str} (Apollo signal)")
+    if scale_signals != list(dossier.get("scale_signals") or []):
+        dossier["scale_signals"] = scale_signals
+        enrichment["dossier"] = dossier
+        render_json["enrichment"] = enrichment
+
+    # Build a single composite scale signal string for the Executive Snapshot and Hypothesis sections.
+    # Format: "Likely: ~8,000 employees; ~$1.1B annual revenue signal; founded 1999; HQ Amsterdam, Netherlands. (Apollo signal) (?)"
+    sig_parts: list[str] = []
+    if emp:
+        sig_parts.append(f"~{emp:,} employees")
+    if rev_str:
+        sig_parts.append(rev_str)
+    founded = org.get("founded_year")
+    if founded:
+        sig_parts.append(f"founded {founded}")
+    hq_parts = [p for p in [org.get("hq_city") or org.get("city"), org.get("hq_state") or org.get("state"), org.get("hq_country") or org.get("country")] if p]
+    if hq_parts:
+        sig_parts.append(f"HQ {', '.join(str(p) for p in hq_parts)}")
+    if sig_parts:
+        known = render_json.get("known") or {}
+        if not known.get("scale_signal"):
+            known["scale_signal"] = "Likely: " + "; ".join(sig_parts) + ". (Apollo signal) (?)"
+            render_json["known"] = known
+
+    # Store the Apollo evidence source string for evidence propagation into question prefill blocks.
+    if user_facing_desc:
+        input_domain = apollo.get("input_domain") or org.get("primary_domain") or org.get("domain") or ""
+        evidence_src = f"Apollo organization enrichment, exact domain match: {input_domain}" if input_domain else "Apollo organization enrichment"
+        dossier = (render_json.get("enrichment") or {}).get("dossier") or {}
+        if not dossier.get("what_they_do_source"):
+            dossier["what_they_do_source"] = evidence_src
+            enrichment = render_json.get("enrichment") or {}
+            enrichment["dossier"] = dossier
+            render_json["enrichment"] = enrichment
+
+
+def _filter_compatible_search_results(
+    search_results: list[dict[str, Any]],
+    enrichment: dict[str, Any],
+    customer: "CustomerIdentity",
+) -> list[dict[str, Any]]:
+    """Remove same-name-different-entity web results from the list stored in render_json.
+
+    This ensures that rejected sources (e.g. sportmonks.com when company=Monks/monks.com)
+    do not appear in Standard Discovery evidence, Public Intelligence Snapshot, or any
+    other section that reads from render_json["search_results"].
+    """
+    company_name = customer.company_name or enrichment.get("company_name") or customer.canonical_name
+    confirmed_domain = customer.domain
+    if not company_name or not confirmed_domain:
+        return search_results
+    return [
+        r for r in search_results
+        if is_canonical_entity_compatible(
+            r.get("url", ""), r.get("title", ""), r.get("snippet", ""),
+            company_name, confirmed_domain,
+        )
+    ]
 
 
 def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | None = None) -> dict[str, Any]:
@@ -2562,8 +3577,8 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
         "enrichment": enrichment,
         "prior_docs": context.prior_docs,
         "prior_notes": [],
-        "search_results": context.search_results,
         "known": context.known,
+        "apollo": context.apollo_enrichment or {},
         "source_status": {
             "calendar": "available" if event else "missing",
             "attendees": "available" if attendees else "missing",
@@ -2572,10 +3587,47 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
             "docs_search": "available" if context.docs_search_available else "unavailable",
             "web_search": context.web_search_status,
             "company_overview_enrichment": context.company_overview_status,
+            "apollo_org": (context.apollo_enrichment or {}).get("status", "disabled"),
+            "apollo_people": (context.apollo_enrichment or {}).get("people_status", "not_attempted"),
+            "web_rejected_count": (enrichment.get("dossier") or {}).get("rejected_web_count", 0),
+            "canonical_identity_source": "apollo_exact_domain" if (context.apollo_enrichment or {}).get("status") in ("organization_matched",) else (
+                "explicit_user_url" if context.user_urls and (enrichment or {}).get("source") in ("explicit_user_url",) else (
+                    "explicit_url_supplemented" if context.user_urls and context.web_search_status not in ("disabled_by_env", "ran_but_no_results") else (
+                        "web_only_fallback" if (context.apollo_enrichment or {}).get("status") == "missing_api_key" else "web_search"
+                    )
+                )
+            ),
+            "explicit_url_enrichment": "used" if context.user_urls and (enrichment or {}).get("source") == "explicit_user_url" else ("supplemented" if context.user_urls else "not_used"),
         },
         "run_id": run_id,
         "customer_key": customer_key,
     }
+    # Filter search_results to entity-compatible sources only and track rejection count.
+    # This prevents rejected same-name-different-entity URLs (e.g. sportmonks.com for Monks)
+    # from appearing in Standard Discovery evidence, Public Intelligence, or any renderer section.
+    # context.search_results is also updated so that build_question_prefill (called later) uses only
+    # compatible sources — preventing rejected URLs from leaking into question evidence fields.
+    _original_search_results = list(context.search_results)
+    _original_search_count = len(_original_search_results)
+    _compatible_results = _filter_compatible_search_results(_original_search_results, enrichment, customer)
+    render_json["search_results"] = _compatible_results
+    context.search_results = _compatible_results
+    _filter_rejected = _original_search_count - len(_compatible_results)
+    if _filter_rejected > 0:
+        _prior = int(render_json["source_status"].get("web_rejected_count") or 0)
+        render_json["source_status"]["web_rejected_count"] = _prior + _filter_rejected
+    # Expose rejected domain set so the render layer can do defense-in-depth filtering
+    # on dossier fields and any other signal that might reference a rejected entity.
+    _compatible_url_set = {r.get("url", "") for r in _compatible_results}
+    _rejected_domains: set[str] = set()
+    for _r in _original_search_results:
+        _u = _r.get("url", "")
+        if _u and _u not in _compatible_url_set:
+            _h = urlparse(_u).netloc.lower().removeprefix("www.")
+            if _h:
+                _rejected_domains.add(_h)
+    render_json["source_status"]["rejected_domains"] = sorted(_rejected_domains)
+
     dossier = enrichment.get("dossier") or {}
     registry = build_evidence_registry(dossier, run_id, customer_key, customer.company_name or enrichment.get("company_name") or customer.canonical_name, customer.domain)
     if not registry and dossier.get("what_they_do") and not str(dossier.get("what_they_do")).startswith("To Validate:"):
@@ -2628,6 +3680,9 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
         render_json["customer_context"] = {"classification": "person_only"}
     else:
         render_json["customer_context"] = {"classification": "unknown"}
+    _augment_render_json_from_apollo(render_json, context.apollo_enrichment or {})
+    # Pass debug flag through render_json so the render layer can suppress noisy fallbacks
+    render_json["debug"] = bool(getattr(args, "debug", False)) if args else False
     if args:
         prompt = load_prospecting_prompt(getattr(args, "prospecting_prompt", None), debug=getattr(args, "debug", False))
         vertical = infer_vertical(context, getattr(args, "industry", None))
@@ -2636,7 +3691,18 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
         render_json["vertical"] = vertical
         render_json["confidence_layers"] = confidence_layers
         apply_production_field_guards(render_json, getattr(args, "industry", None) if not getattr(args, "workload", None) else getattr(args, "workload", None))
-        questions, omitted, readiness = build_question_prefill(context, vertical, confidence_layers)
+        _add_vertical_fit_from_apollo(render_json)
+        # Use Apollo description for prefill when it's an exact domain match, stripping Likely/signal markers
+        _prefill_desc = ""
+        if (context.apollo_enrichment or {}).get("status") == "organization_matched":
+            _aug_enrichment = render_json.get("enrichment") or {}
+            _aug_desc = str(_aug_enrichment.get("description") or "").strip()
+            # Strip "Likely: " prefix and " (Apollo signal) (?)" / " (?)" suffix
+            _aug_desc = re.sub(r'^Likely:\s*', '', _aug_desc)
+            _aug_desc = re.sub(r'\s*\(Apollo signal\)\s*\(\?\)\s*$', '', _aug_desc)
+            _aug_desc = re.sub(r'\s*\(\?\)\s*$', '', _aug_desc).strip()
+            _prefill_desc = _aug_desc
+        questions, omitted, readiness = build_question_prefill(context, vertical, confidence_layers, description_override=_prefill_desc or None)
         if getattr(args, "workload", None):
             render_json["explicit_workload"] = args.workload
         render_json["prospecting"] = {
@@ -2653,6 +3719,7 @@ def context_to_renderer_json(context: PrepContext, args: argparse.Namespace | No
         render_json["vertical"] = vertical
         render_json["confidence_layers"] = infer_confidence_layers(context, vertical, None)
         apply_production_field_guards(render_json, None)
+        _add_vertical_fit_from_apollo(render_json)
     return render_json
 
 
@@ -2754,6 +3821,9 @@ def apply_production_field_guards(render_json: dict[str, Any], explicit_industry
     else:
         subtype_name = subtype.get("name", "unknown")
         for field in ("what_they_do", "target_users", "business_model"):
+            # Skip what_they_do when it comes from an Apollo exact-domain match — it is authoritative
+            if field == "what_they_do" and dossier.get("what_they_do_source") == "apollo_exact_domain":
+                continue
             field_text = str(dossier.get(field) or "")
             reason = incompatible_field_reason(field_text, subtype_name, False)
             if not reason and vertical.get("name") == "marketing_adtech" and any(term in field_text.lower() for term in ("consumer devices", "hardware sales", "app store", "accessories", "broadcasting", "streaming", "format licensing")):
@@ -2787,6 +3857,34 @@ def apply_production_field_guards(render_json: dict[str, Any], explicit_industry
             if not dossier.get("business_model") or str(dossier.get("business_model")).startswith("business model/revenue model is not confirmed") or incompatible_field_reason(str(dossier.get("business_model")), subtype_name):
                 dossier["business_model"] = template["business_model"]
                 warnings.append("filled_business_model_from_current_subtype")
+
+        if subtype_name == "agency_marketing_services":
+            # Always apply canonical agency target_users — the generic condition above only replaces when
+            # explicitly incompatible, but "consumers, developers, ecosystem partners" (consumer-tech
+            # phrasing) slips through. For confirmed agency subtype, always use the canonical value.
+            dossier["target_users"] = VERTICAL_SUBTYPE_TEMPLATES["agency_marketing_services"]["target_users"]
+            warnings.append("enforced_target_users_agency")
+
+            modules = list(dossier.get("product_modules") or [])
+            # Remove BytePlus AI model product names — these describe BytePlus offerings, not agency service lines
+            byteplus_ai_modules = {"API / enterprise plans", "Custom models", "xMatch / GenAI optimization",
+                                   "AI image generation", "AI video generation", "Voice/audio generation",
+                                   "Background remover", "Upscaler", "Intent marketing platform", "Comparison platforms"}
+            modules = [m for m in modules if m not in byteplus_ai_modules]
+            if not modules:
+                modules = ["marketing services", "creative production", "technology services",
+                           "digital media", "data/measurement", "consulting", "campaign/content services"]
+            dossier["product_modules"] = modules
+            warnings.append("normalized_product_modules_agency")
+            # Replace expansion_opportunity with agency-specific directions
+            _known = render_json.get("known") or {}
+            _known["expansion_opportunity"] = (
+                "Possible directions after validation: campaign creative generation, "
+                "creative localization, model/API workflow for campaign pipelines, "
+                "creative QA / brand safety automation."
+            )
+            render_json["known"] = _known
+            warnings.append("normalized_expansion_opportunity_agency")
 
     filtered_registry: list[dict[str, Any]] = []
     subtype_name = (dossier.get("vertical_subtype") or {}).get("name", "unknown")
@@ -2901,7 +3999,17 @@ def validate_rendered_output(render_json: dict[str, Any], markdown: str) -> list
         normalize_url_for_validation(url)
         for url in re.findall(r"Evidence: (https?://[^\s|,]+)", markdown)
     }
-    missing = {url for url in cited_urls if url and url not in registry_urls}
+    confirmed_domain_for_validation = ((render_json.get("customer") or {}).get("domain") or "").lower().removeprefix("www.")
+    missing = set()
+    for url in cited_urls:
+        if not url or url in registry_urls:
+            continue
+        # Confirmed-domain URLs are inherently valid identity anchors; no registry entry required.
+        if confirmed_domain_for_validation:
+            url_host = url.lower().split("/")[2].removeprefix("www.") if "://" in url else url.lower().removeprefix("www.").split("/")[0]
+            if url_host == confirmed_domain_for_validation or url_host.endswith("." + confirmed_domain_for_validation):
+                continue
+        missing.add(url)
     if missing:
         warnings.append("output_validation: cited evidence URL missing from registry: " + ", ".join(sorted(missing)[:3]))
     return warnings
@@ -3064,7 +4172,22 @@ def send_notification(result: PrepResult, context: PrepContext, args: argparse.N
 def process_single(prep_input: PrepInput, args: argparse.Namespace, *, event: dict[str, Any] | None = None) -> PrepResult:
     if prep_input.mode == "event-id" and event is None:
         event = fetch_event(prep_input.value or "", debug=args.debug)
-    context = build_context(prep_input, event=event, debug=args.debug)
+    context = build_context(
+        prep_input,
+        event=event,
+        debug=args.debug,
+        no_apollo=getattr(args, "no_apollo", False),
+        apollo_refresh=getattr(args, "apollo_refresh", False),
+        apollo_debug=getattr(args, "apollo_debug", False),
+        apollo_max_people=getattr(args, "apollo_max_people", None),
+    )
+    _apollo_status = (context.apollo_enrichment or {}).get("status", "disabled")
+    if _apollo_status == "missing_api_key" and not getattr(args, "no_apollo", False):
+        print(
+            "Warning: Apollo API key missing; running web-only fallback. "
+            "Identity confidence may be lower. Set APOLLO_API_KEY to enable enrichment.",
+            file=sys.stderr,
+        )
     render_json = context_to_renderer_json(context, args)
     markdown = render(render_json)
     validation_warnings = validate_rendered_output(render_json, markdown)

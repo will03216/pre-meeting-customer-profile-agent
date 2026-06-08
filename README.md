@@ -49,17 +49,37 @@ Useful options:
 --industry         Force an industry playbook such as marketing_adtech, ai_video_creative, ecommerce, gaming, or enterprise_llm
 --prospecting-prompt <path>
                   Load prospecting guidance from a custom markdown file
+--no-apollo        Disable Apollo.io enrichment for this run
+--apollo-refresh   Bypass Apollo cache and fetch fresh data
+--apollo-max-people <n>
+                  Max stakeholder candidates from Apollo (default: APOLLO_MAX_PEOPLE env or 5)
+--apollo-debug     Print Apollo API diagnostics to stderr
 --debug            Print diagnostics without secrets
 ```
 
 Dry-run examples:
 
 ```bash
-python scripts/run_prep.py --customer "Moburst" --dry-run --debug
-python scripts/run_prep.py --domain "moburst.com" --dry-run --output-json
-python scripts/run_prep.py --email "isaac@moburst.com" --dry-run
-python scripts/run_prep.py --window tomorrow --dry-run
-python scripts/run_prep.py --domain naturalint.com --industry marketing_adtech --dry-run --debug
+python3 scripts/run_prep.py --customer "Moburst" --dry-run --debug
+python3 scripts/run_prep.py --domain "moburst.com" --dry-run --output-json
+python3 scripts/run_prep.py --email "isaac@moburst.com" --dry-run
+python3 scripts/run_prep.py --window tomorrow --dry-run
+python3 scripts/run_prep.py --domain naturalint.com --industry marketing_adtech --dry-run --debug
+```
+
+Apollo enrichment live test (isolates Apollo signal, skips web search):
+
+```bash
+# Test Apollo enrichment and domain guard — jelly-fish.co.kr is a Korean company;
+# Apollo may match the US company jellyfish.co which should be rejected.
+PREP_WEB_SEARCH_DISABLED=1 python3 scripts/run_prep.py \
+  --customer "Jellyfish" --domain "jelly-fish.co.kr" \
+  --apollo-refresh --apollo-debug --no-notify --dry-run
+
+# Full live run (creates doc, runs web enrichment too):
+python3 scripts/run_prep.py \
+  --customer "Jellyfish" --domain "jelly-fish.co.kr" \
+  --apollo-refresh --apollo-debug --create-doc --no-notify
 ```
 
 ## Configuration
@@ -75,6 +95,14 @@ PREP_DOC_FOLDER_TOKEN=<folder_token>
 PREP_NOTIFY_USER_ID=<open_id>
 MCP_CUSTOMER_ENRICHMENT_URL=https://...
 MCP_CUSTOMER_ENRICHMENT_TOKEN=<token>
+
+# Apollo.io enrichment (optional — leave blank to disable)
+APOLLO_API_KEY=<your_apollo_api_key>
+APOLLO_MAX_PEOPLE=5
+APOLLO_CACHE_TTL_HOURS=24
+APOLLO_WATERFALL_ENABLED=0
+APOLLO_REVEAL_EMAILS=0
+APOLLO_REVEAL_PHONE_NUMBERS=0
 ```
 
 If the user does not have access to the configured Customer Profiles folder, the skill will either create the doc in the user's default space or write a local markdown fallback.

@@ -34,6 +34,10 @@ VERTICAL_SUBTYPE_TEMPLATES = {
         "target_users": "TV/streaming audiences, broadcasters/streamers, production partners, content buyers, and media partners",
         "business_model": "broadcasting, streaming, content production, format licensing/global distribution, and media partnerships",
     },
+    "music_entertainment": {
+        "target_users": "fans, artists, entertainment audiences, music listeners, brand partners, platforms, media/content partners",
+        "business_model": "artist management, music/record production, release promotion, content/IP monetization, events/performances, brand partnerships",
+    },
     "consumer_technology": {
         "target_users": "consumers, developers, enterprise customers, creative professionals, and ecosystem partners",
         "business_model": "hardware sales, software/services revenue, app ecosystem, subscriptions, accessories, and support",
@@ -43,6 +47,59 @@ VERTICAL_SUBTYPE_TEMPLATES = {
         "business_model": "subscriptions, credits, asset licensing, API usage, enterprise/team plans, and creative tools",
     },
 }
+
+
+_CURRENCY_SYMBOLS: dict[str, str] = {"USD": "$", "EUR": "€", "GBP": "£", "CNY": "¥", "JPY": "¥", "KRW": "₩"}
+
+
+def _format_apollo_revenue(value: object, currency: str | None = None) -> str:
+    """Format an Apollo revenue value into a human-readable string."""
+    raw = str(value or "").strip().replace(",", "")
+    if not raw:
+        return ""
+    try:
+        num = float(raw.lstrip("$£€¥₩").strip())
+    except (ValueError, TypeError):
+        return raw
+    if num >= 1e9:
+        number_str = f"{num / 1e9:.1f}B"
+    elif num >= 1e6:
+        number_str = f"{num / 1e6:.0f}M"
+    elif num >= 1e3:
+        number_str = f"{num / 1e3:.0f}K"
+    else:
+        number_str = str(int(num))
+    symbol = _CURRENCY_SYMBOLS.get((currency or "").upper(), "")
+    if symbol:
+        return f"~{symbol}{number_str} annual revenue signal"
+    if currency:
+        return f"~{number_str} {currency.upper()} annual revenue signal"
+    return f"~{number_str} annual revenue signal (currency not confirmed)"
+
+
+_BYTEPLUS_RELEVANT_TECH_SUBSTRINGS: frozenset[str] = frozenset({
+    "ai", "ml", "llm", "gpt", "claude", "machine learning", "deep learning", "generative",
+    "api", "api gateway", "cloud", "aws", "azure", "gcp", "kubernetes", "docker",
+    "bedrock", "sagemaker", "vertex", "cloud infrastructure",
+    "analytics", "data", "bigquery", "snowflake", "databricks", "data pipeline", "mlops",
+    "automation", "workflow", "video", "creative", "content", "model", "inference",
+    "pytorch", "tensorflow", "openai", "anthropic", "replicate", "hugging face",
+    "advertising", "adtech", "marketing tech", "campaign",
+    "computer vision", "nlp", "diffusion", "embedding",
+})
+
+
+def _filter_byteplus_relevant_techs(techs: list, max_count: int = 6) -> list[str]:
+    """Return up to max_count technology names ranked by BytePlus relevance."""
+    if not techs:
+        return []
+    tech_strs = [str(t).strip() for t in techs if t]
+    priority = [t for t in tech_strs if any(kw in t.lower() for kw in _BYTEPLUS_RELEVANT_TECH_SUBSTRINGS)]
+    fallback = [t for t in tech_strs if t not in priority]
+    result = priority[:max_count]
+    if len(result) < 3:
+        result.extend(fallback[:max_count - len(result)])
+    return result[:max_count]
 
 
 def contains_placeholder(text: str | None) -> bool:
@@ -436,6 +493,9 @@ def core_business_label_and_evidence(data: dict, core_business: str | None = Non
     source = best_evidence_url(data)
     if source:
         return "known", source
+    apollo_source = dossier.get("what_they_do_source") or ""
+    if apollo_source:
+        return "likely", apollo_source
     if str(dossier.get("what_they_do_confidence") or "").lower() == "likely" or text:
         return "likely", "Not Found"
     return "to_validate", "Not Found"
@@ -476,10 +536,20 @@ def add_field_validation_warning(data: dict, warning: str) -> None:
     status["field_validation"] = "; ".join(parts)
 
 
+def _is_apollo_hypothesis_fit(data: dict) -> bool:
+    """True when fit hypotheses come from Apollo vertical inference (workload not confirmed)."""
+    return (data.get("enrichment") or {}).get("fit_source") == "apollo_hypothesis"
+
+
 def effective_use_cases(data: dict) -> list[str]:
-    if weak_identity(data) or not active_workload_confirmed(data):
+    if weak_identity(data):
         return ["To Validate: active AI or BytePlus-relevant workload is not confirmed."]
     enrichment = data.get("enrichment") or {}
+    # Apollo vertical hypothesis: return hypotheses even without confirmed workload
+    if _is_apollo_hypothesis_fit(data):
+        return enrichment.get("known_use_cases") or ["To Validate: workload hypotheses could not be generated."]
+    if not active_workload_confirmed(data):
+        return ["To Validate: active AI or BytePlus-relevant workload is not confirmed."]
     vertical_name = (data.get("vertical") or {}).get("name")
     if not enrichment.get("known_use_cases") and vertical_name == "ai_video_creative":
         return ["Likely: image/video creative generation, editing, or batch production workflow (?)"]
@@ -488,8 +558,44 @@ def effective_use_cases(data: dict) -> list[str]:
     return enrichment.get("known_use_cases") or ["To Validate: no confirmed AI workload or BytePlus use case found from current sources."]
 
 
+def effective_use_cases_concise(data: dict) -> str:
+    """Single-line use-case summary for table cells. Concise when hypotheses come from Apollo."""
+    if not _is_apollo_hypothesis_fit(data):
+        return join_non_empty(
+            effective_use_cases(data),
+            fallback="To Validate: no confirmed AI workload found.",
+        )
+    use_cases = (data.get("enrichment") or {}).get("known_use_cases") or []
+    if not use_cases:
+        return "To Validate: no confirmed AI workload found."
+    themes = []
+    for uc in use_cases[:3]:
+        text = uc
+        for prefix in ("Possible fit hypothesis to validate: ", "Possible fit hypothesis to validate:", "Likely fit hypothesis to validate: ", "Likely fit hypothesis to validate:", "Likely: "):
+            if text.lower().startswith(prefix.lower()):
+                text = text[len(prefix):].strip()
+                break
+        for sep in (" — ", " – ", " (?)"):
+            if sep in text:
+                text = text.split(sep)[0].strip()
+        text = text.rstrip(".?!,")
+        if text:
+            themes.append(text)
+    if not themes:
+        return "To Validate: no confirmed AI workload found."
+    if len(themes) == 1:
+        return f"Possible hypotheses to validate: {themes[0]}."
+    return f"Possible hypotheses to validate: {', '.join(themes[:-1])}, and {themes[-1]}."
+
+
 def effective_product_fit(data: dict) -> list[dict]:
-    if weak_identity(data) or not product_fit_allowed(data):
+    if weak_identity(data):
+        return []
+    enrichment = data.get("enrichment") or {}
+    # Apollo vertical hypothesis bypass: show hypotheses without workload confirmation
+    if _is_apollo_hypothesis_fit(data):
+        return enrichment.get("possible_byteplus_fit") or []
+    if not product_fit_allowed(data):
         return []
     enrichment = data.get("enrichment") or {}
     vertical_name = (data.get("vertical") or {}).get("name")
@@ -501,29 +607,56 @@ def effective_product_fit(data: dict) -> list[dict]:
         return fit
     if vertical_name == "ai_video_creative":
         return [
-            {"product": "Seedance", "reason": "Validate fit for video generation quality, consistency, and short-form creative workflows", "confidence": "medium"},
-            {"product": "Seedream", "reason": "Validate fit for image generation, editing, upscaling, and creative asset production", "confidence": "medium"},
-            {"product": "Ark / model platform", "reason": "Validate model evaluation, deployment, routing, cost/performance, and API-scale needs", "confidence": "medium"},
+            {"product": "Seedance", "reason": "video generation quality, consistency, and short-form creative workflows", "validation": "Validate current model stack, generation volume, and quality/latency benchmarks.", "confidence": "medium"},
+            {"product": "Seedream", "reason": "image generation, editing, upscaling, and creative asset production", "validation": "Validate image generation pipeline, editing workflow, and upscaling needs.", "confidence": "medium"},
+            {"product": "Ark / model platform", "reason": "model evaluation, deployment, routing, cost/performance, and API-scale needs", "validation": "Validate API usage, routing requirements, and cost/latency expectations.", "confidence": "medium"},
         ]
     if vertical_name == "marketing_adtech":
         return [
-            {"product": "Ark / model platform", "reason": "Validate fit for scalable model evaluation, routing, inference cost control, and integration into acquisition/optimization workflows", "confidence": "medium"},
-            {"product": "Seedance", "reason": "Validate whether paid-media or landing-page video creative generation is a near-term workload", "confidence": "low"},
-            {"product": "Seedream", "reason": "Validate whether display/ad creative variation, localized imagery, or landing-page asset generation is a near-term workload", "confidence": "low"},
+            {"product": "Ark / model platform", "reason": "scalable model evaluation, routing, inference cost control, and integration into acquisition/optimization workflows", "validation": "Validate current model stack, API usage pattern, and cost/latency expectations.", "confidence": "medium"},
+            {"product": "Seedance", "reason": "paid-media or landing-page video creative generation as a near-term workload", "validation": "Validate creative workflow and video generation volume.", "confidence": "low"},
+            {"product": "Seedream", "reason": "display/ad creative variation, localized imagery, or landing-page asset generation as a near-term workload", "validation": "Validate image generation workflow and creative variation needs.", "confidence": "low"},
         ]
     return []
 
 
+_GENERIC_FIT_FALLBACK = [
+    "- To Validate: identify active workload first.",
+    "- Possible direction after validation: Ark if model platform / API / routing / inference need is confirmed.",
+    "- Possible direction after validation: Seedream if image generation/editing need is confirmed.",
+    "- Possible direction after validation: Seedance if video generation need is confirmed.",
+]
+
+
 def product_fit_lines(data: dict) -> list[str]:
+    """Format fit hypotheses for the Executive Prep Snapshot 'Why This May Matter' section."""
     fit = effective_product_fit(data)
     if not fit:
-        return [
-            "- To Validate: identify active workload first.",
-            "- Possible direction after validation: Ark if model platform / API / routing / inference need is confirmed.",
-            "- Possible direction after validation: Seedream if image generation/editing need is confirmed.",
-            "- Possible direction after validation: Seedance if video generation need is confirmed.",
-        ]
-    return [f"- {item.get('product') or 'BytePlus product'}: {item.get('reason') or 'Validate fit in meeting'}" for item in fit[:4]]
+        return _GENERIC_FIT_FALLBACK
+    layers = confidence_layers(data)
+    workload_conf = layers.get("active_workload_confidence", "unknown")
+    prefix = "Confirmed workload fit" if workload_conf == "confirmed" else "Possible fit hypothesis to validate"
+    return [
+        f"- {prefix}: {item.get('product') or 'BytePlus product'} for {item.get('reason') or 'Validate fit in meeting'}."
+        for item in fit[:4]
+    ]
+
+
+def _product_fit_lines_internal(data: dict) -> list[str]:
+    """Format fit hypotheses for the Internal Hypothesis section with validation prompts."""
+    fit = effective_product_fit(data)
+    if not fit:
+        return _GENERIC_FIT_FALLBACK
+    lines = []
+    for item in fit[:4]:
+        product = item.get("product") or "BytePlus product"
+        reason = item.get("reason") or "Validate fit in meeting"
+        validation = item.get("validation") or ""
+        line = f"- {product}: {reason}."
+        if validation:
+            line += f" {validation}"
+        lines.append(line)
+    return lines
 
 
 def normalized_person_background(description: str, customer_name: str, source: str) -> str:
@@ -578,7 +711,13 @@ def source_attribution(data: dict) -> str:
         used.append("prior AI Notes / Minutes")
     enrichment_source = enrichment.get("source")
     if enrichment.get("available") and enrichment_source != "web_search":
-        used.append("MCP enrichment")
+        apollo_org_status = source_status.get("apollo_org", "")
+        if apollo_org_status in ("organization_matched", "partial"):
+            used.append("Apollo organization enrichment")
+        elif enrichment.get("fit_source") == "apollo_hypothesis":
+            used.append("Apollo organization enrichment")
+        else:
+            used.append("enrichment")
     web_results = [item for item in search_results if item.get("source") == "web"]
     kb_results = [item for item in search_results if item.get("source") != "web"]
     if web_results:
@@ -587,7 +726,7 @@ def source_attribution(data: dict) -> str:
         used.append("Mira / Knowledge Base references")
 
     if used == ["calendar data"]:
-        return "Prep generated from calendar data only. Prior docs, MCP enrichment, web search, and Mira/Knowledge Base references were unavailable in this run."
+        return "Prep generated from calendar data only. Prior docs, Apollo enrichment, web search, and Mira/Knowledge Base references were unavailable in this run."
     sentence = "Prep generated from " + ", ".join(used) + "."
     if prior_docs and not used_prior_docs:
         sentence += " Candidate prior docs were found but no usable prior customer profile content was extracted."
@@ -602,6 +741,15 @@ def derive_questions(data: dict) -> list[str]:
             "Are you evaluating LLM/model platform, image/video generation, API integration, or another use case?",
             "Who owns the technical and commercial decision?",
             "What would make a next step or POC worthwhile?",
+        ]
+    vertical_name = (data.get("vertical") or {}).get("name") or ""
+    if vertical_name == "consumer_technology" and not active_workload_confirmed(data):
+        return [
+            "Which team is this discussion for: product, developer platform, AI/ML, marketing, content, or operations?",
+            "Is the priority internal AI tooling, model/API infrastructure, multimodal understanding, or creative/product marketing workflows?",
+            "What current model/vendor stack or internal platform is being evaluated?",
+            "What success metric matters most: quality, latency, privacy/compliance, cost, developer productivity, or launch readiness?",
+            "Is there a defined POC timeline or evaluation milestone?",
         ]
     if weak_or_unknown_vertical(data) or not active_workload_confirmed(data):
         return [
@@ -643,6 +791,7 @@ def executive_snapshot(data: dict, customer_name: str, company_name: str | None,
     contact_name = customer.get("contact") or ""
     display_name = f"{contact_name} at {company_name or customer_name}" if contact_name and (company_name or customer_name) else customer_name + (f" at {company_name}" if company_name else "")
     layers = confidence_layers(data)
+    workload_section_label = "**Workload hypotheses to validate:**" if _is_apollo_hypothesis_fit(data) else "**Likely AI Workloads:**"
 
     validate = questions[:4]
     while len(validate) < 4:
@@ -656,7 +805,7 @@ def executive_snapshot(data: dict, customer_name: str, company_name: str | None,
             "",
             f"**Core Business Hypothesis:** {core_business_labeled}",
             "",
-            "**Likely AI Workloads:**",
+            workload_section_label,
             *[f"- {item}" for item in use_cases[:5]],
             "",
             "**Why This May Matter For BytePlus:**",
@@ -671,12 +820,120 @@ def executive_snapshot(data: dict, customer_name: str, company_name: str | None,
             f"- Vertical evidence: {join_non_empty(vertical.get('evidence'), fallback='Not Found')}",
             f"- Website: {customer.get('website') or 'To Validate'}",
             f"- Stakeholder context: {known.get('stakeholder_context') or 'To Validate'}",
-            f"- Scale signal: {known.get('monthly_volume') or known.get('paid_users') or 'To Validate'}",
+            f"- Scale signal: {known.get('scale_signal') or known.get('monthly_volume') or known.get('paid_users') or 'To Validate'}",
             "",
             "**Top Things To Validate In The Meeting:**",
             *[f"{idx}. {question}" for idx, question in enumerate(validate, 1)],
         ]
     )
+
+
+def _build_apollo_essential_rows(data: dict) -> list[tuple[str, str]]:
+    """Return (field, value) rows from Apollo org data for the Essential Background Check.
+
+    Shows rejection/failure notes for meaningful failures so they are visible in
+    the document, not only in the Run Report. Silent statuses (disabled, missing_api_key,
+    organization_not_found) produce no rows.
+    All matched values are labeled Likely to comply with the no-hallucination policy.
+    """
+    apollo = data.get("apollo") or {}
+    status = apollo.get("status", "disabled")
+
+    if status == "rejected_due_to_domain_mismatch":
+        warnings = apollo.get("warnings") or []
+        detail = warnings[0] if warnings else "Apollo matched a different company domain."
+        note = f"Apollo unavailable / domain mismatch. {detail} Direct URL and web fallback used. Validate domain with customer."
+        return [("Apollo Enrichment", note)]
+
+    if status in ("auth_failed_401", "forbidden_403", "rate_limited_429", "timeout",
+                  "network_error", "invalid_response", "request_failed"):
+        return [("Apollo Enrichment", f"Not available: {status}")]
+
+    if status not in ("organization_matched", "partial"):
+        return []
+
+    org = apollo.get("organization") or {}
+    rows: list[tuple[str, str]] = []
+
+    emp = org.get("employee_count") or org.get("estimated_num_employees")
+    if emp:
+        rows.append(("Employee Count (Apollo)", f"Likely: ~{emp:,} employees (Apollo signal) (?)"))
+
+    revenue = org.get("annual_revenue")
+    if revenue and str(revenue).strip():
+        currency = org.get("annual_revenue_currency") or org.get("revenue_currency")
+        rev_str = _format_apollo_revenue(revenue, currency)
+        rows.append(("Revenue Signal (Apollo)", f"Likely: {rev_str} (Apollo signal) (?)"))
+
+    founded = org.get("founded_year")
+    if founded:
+        enrichment = data.get("enrichment") or {}
+        dossier = enrichment.get("dossier") or {}
+        if not dossier.get("founded_year"):
+            rows.append(("Founded / Operating Since (Apollo)", f"Likely: {founded} (Apollo signal) (?)"))
+
+    hq_parts = [p for p in [org.get("hq_city"), org.get("hq_state"), org.get("hq_country")] if p]
+    if hq_parts:
+        enrichment = data.get("enrichment") or {}
+        dossier = enrichment.get("dossier") or {}
+        if not dossier.get("hq"):
+            rows.append(("HQ / Location (Apollo)", f"Likely: {', '.join(hq_parts)} (Apollo signal) (?)"))
+
+    linkedin = org.get("linkedin_url")
+    if linkedin:
+        rows.append(("LinkedIn (Apollo)", f"Likely: {linkedin} (Apollo signal) (?)"))
+
+    techs = org.get("technologies") or org.get("technology_names") or []
+    filtered_techs = _filter_byteplus_relevant_techs(techs, max_count=6)
+    if filtered_techs:
+        tech_str = ", ".join(filtered_techs)
+        rows.append(("Technology Signals (Apollo)", f"Likely: {tech_str} (Apollo signal) (?)"))
+
+    short_desc_en = org.get("short_description_en") or org.get("short_description") or ""
+    if short_desc_en:
+        enrichment = data.get("enrichment") or {}
+        main_desc = (enrichment.get("dossier") or {}).get("what_they_do") or enrichment.get("description") or ""
+        if not main_desc or str(main_desc).startswith("To Validate:"):
+            desc_row = f"Likely: {short_desc_en} (Apollo signal) (?)"
+            original = org.get("apollo_desc_original")
+            if original:
+                desc_row += f" | Original source text: {original}"
+            rows.append(("Company Description (Apollo)", desc_row))
+
+    # Non-blocking note for people search failures (e.g. 403 on free plan)
+    people_status = apollo.get("people_status") or ""
+    _PEOPLE_SILENT_STATUSES = {"not_attempted", "people_found", "no_people_found", ""}
+    if people_status and people_status not in _PEOPLE_SILENT_STATUSES:
+        rows.append(("Apollo People Search", f"Unavailable ({people_status}). Stakeholders remain To Validate."))
+
+    return rows
+
+
+def apollo_stakeholders_section(data: dict) -> str:
+    """Render Apollo-sourced stakeholder candidate table, if any people were found."""
+    apollo = data.get("apollo") or {}
+    people = apollo.get("people") or []
+    if not people:
+        return ""
+    lines = [
+        "### Apollo Stakeholder Candidates",
+        "",
+        "Candidates sourced from Apollo. Validate names, titles, and roles before the meeting.",
+        "",
+        "| Name | Title | Dept / Seniority | Why Relevant | Source |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for person in people:
+        name = str(person.get("name") or "").strip() or "—"
+        title = str(person.get("title") or "").strip() or "—"
+        dept = str(person.get("department") or "").strip()
+        seniority = str(person.get("seniority") or "").strip()
+        dept_seniority = ", ".join(p for p in [dept, seniority] if p) or "—"
+        why = str(person.get("why_relevant") or "Potential stakeholder — validate role and buying authority").strip()
+        source = str(person.get("source") or "Apollo").strip()
+        lines.append(f"| {name} | {title} | {dept_seniority} | {why} | {source} |")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def company_dossier_section(data: dict) -> str:
@@ -799,9 +1056,10 @@ def company_dossier_section(data: dict) -> str:
         ("Social / Content / Paid Media Presence", labeled_text(social_presence, "not_found" if (not workload_confirmed or not dossier.get("social_content_presence")) else "likely", followup="Do you produce paid social, landing page, image, or video creative at scale?")),
         ("Pricing / Packaging", labeled_text(pricing_packaging_note(dossier.get("pricing_tiers")), "to_validate")),
         ("Scale Signals", labeled_text(dossier.get("scale_signals"), "likely", fallback="Not Found: no scale signals found")),
-        ("Founder / Leadership", labeled_text(dossier.get("founders_or_leadership"), "likely", fallback="Not Found: no founder or leadership signal found")),
+        ("Founder / Leadership", labeled_text(dossier.get("founders_or_leadership"), "likely", fallback="Not Found: no compatible founder or leadership signal found.")),
         ("Founded / Operating Since", labeled_text(dossier.get("founded_year"), "likely" if dossier.get("founded_year") else "not_found", fallback="Not Found: no founding year found")),
         ("HQ / Location", labeled_text(dossier.get("hq") or customer.get("hq"), "likely" if (dossier.get("hq") or customer.get("hq")) else "not_found", fallback="Not Found: no HQ/location found")),
+        *_build_apollo_essential_rows(data),
         ("Not Found", val(dossier.get("not_found"), "None")),
     ]
     return "### Essential Background Check\n\n" + table(rows)
@@ -811,18 +1069,19 @@ def internal_hypothesis_section(data: dict, questions: list[str]) -> str:
     enrichment = data.get("enrichment") or {}
     known = data.get("known") or {}
     prospecting = data.get("prospecting") or {}
+    workload_label = "Workload hypotheses to validate" if _is_apollo_hypothesis_fit(data) else "Likely AI workloads"
     lines = [
         "### Prepare Internal Hypothesis",
         "",
         "- Metric focus to validate: quality, cost per generation, latency, reliability, or enterprise conversion.",
-        f"- Likely AI workloads: {join_non_empty(effective_use_cases(data), fallback=TO_VALIDATE)}",
+        f"- {workload_label}: {effective_use_cases_concise(data)}",
         f"- Product modules observed: {'To Validate: identify active workload first.' if (weak_identity(data) or not active_workload_confirmed(data)) else (known.get('expansion_opportunity') or TO_VALIDATE)}",
         f"- Possible pain points: {pain_points_note(data)}",
         f"- Current vendors / competitors to validate: {join_non_empty(enrichment.get('known_competitors'), fallback='Not found in available sources')}",
-        f"- Public scale signal: {known.get('monthly_volume') or known.get('paid_users') or 'Not found in available sources'}",
+        f"- Public scale signal: {known.get('scale_signal') or known.get('monthly_volume') or known.get('paid_users') or 'Not found in available sources'}",
         "- BytePlus fit hypotheses:",
     ]
-    lines.extend(f"  {line}" for line in product_fit_lines(data))
+    lines.extend(f"  {line}" for line in _product_fit_lines_internal(data))
     lines.extend(["", "### Meeting Readiness", ""])
     assets = prospecting.get("meeting_readiness_assets") or []
     if assets:
@@ -923,7 +1182,46 @@ def evidence_table(data: dict) -> str:
         ]
     if primary:
         evidence = sorted(evidence, key=lambda item: 0 if (item.get("source_url") or item.get("url")) == primary else 1)
-    if not evidence:
+    # Apollo org evidence rows
+    apollo = data.get("apollo") or {}
+    apollo_org = apollo.get("organization") or {}
+    apollo_evidence: list[dict] = []
+    if apollo.get("status") in ("organization_matched", "partial") and apollo_org.get("name"):
+        apollo_domain = apollo_org.get("domain") or apollo_org.get("website_url") or ""
+        apollo_url = f"https://{apollo_domain}" if apollo_domain and not apollo_domain.startswith("http") else apollo_domain
+        emp = apollo_org.get("employee_count") or apollo_org.get("estimated_num_employees")
+        if emp:
+            apollo_evidence.append({
+                "claim_text": f"Apollo: ~{emp:,} employees",
+                "tier_label": "Tier 3 - Apollo enrichment",
+                "source_url": apollo_url or "https://apollo.io",
+            })
+        short_desc_en = apollo_org.get("short_description_en") or apollo_org.get("short_description") or ""
+        if short_desc_en:
+            # Use at most 1 sentence in Evidence Table cells to avoid very long rows
+            cell_text = short_desc_en
+            if len(cell_text) > 180:
+                first_end = max(cell_text.find(". "), cell_text.find("! "), cell_text.find("? "))
+                if 0 < first_end <= 220:
+                    cell_text = cell_text[:first_end + 1]
+                else:
+                    # Truncate at word boundary, never mid-word
+                    cell_text = cell_text[:180].rsplit(" ", 1)[0].rstrip(".,;") + "."
+            apollo_evidence.append({
+                "claim_text": f"Apollo: {cell_text}",
+                "tier_label": "Tier 3 - Apollo enrichment",
+                "source_url": apollo_url or "https://apollo.io",
+            })
+        original_desc = apollo_org.get("apollo_desc_original")
+        if original_desc:
+            orig_cell = original_desc[:200].rsplit(" ", 1)[0] if len(original_desc) > 200 else original_desc
+            apollo_evidence.append({
+                "claim_text": f"Original source text: {orig_cell}",
+                "tier_label": "Tier 3 - Apollo enrichment",
+                "source_url": apollo_url or "https://apollo.io",
+            })
+
+    if not evidence and not apollo_evidence:
         return "No evidence table available."
     rows = ["| Claim / Signal | Source Tier | URL |", "| --- | --- | --- |"]
     seen_claims: set[str] = set()
@@ -934,9 +1232,1078 @@ def evidence_table(data: dict) -> str:
             continue
         seen_claims.add(claim_key)
         rows.append(f"| {val(claim)} | {val(item.get('tier_label'))} | {val(item.get('source_url') or item.get('url'))} |")
+    for item in apollo_evidence:
+        claim = str(item.get("claim_text") or "").strip()
+        claim_key = claim.lower().strip()
+        if not claim or claim_key in seen_claims:
+            continue
+        seen_claims.add(claim_key)
+        rows.append(f"| {val(claim)} | {val(item.get('tier_label'))} | {val(item.get('source_url'))} |")
     if len(rows) == 2:
         return "No evidence table available."
     return "\n".join(rows)
+
+
+# ── Vertical intelligence knowledge base ─────────────────────────────────────
+# Each entry: (modality, possible_opportunity, why_it_matters, sizing_needed, first_question)
+_VERTICAL_OPPORTUNITY_MAP: dict[str, list[tuple[str, str, str, str, str]]] = {
+    "marketing_adtech": [
+        ("Text / LLM", "Campaign copy, briefing assistant, performance insights, internal AI tools", "High text-content volume; creative and media teams benefit from LLM-assisted workflows", "Copy/briefing requests per month", "Do your creative or strategy teams use AI writing tools today?"),
+        ("Language / Localization", "Multilingual campaign adaptation, ad copy localization, brand tone across markets", "Multi-market campaigns require consistent localized creative at scale", "Number of markets and language pairs", "How many markets do you run campaigns for, and how is localization handled today?"),
+        ("Image", "Ad creative generation, campaign variant production, visual localization", "Creative velocity and variant testing are high-priority at performance agencies and adtech", "Monthly creative variations per campaign", "How many image or banner variants do you produce per campaign, and what tools generate them?"),
+        ("Video", "Short-form ad creative, campaign video, product/brand videos, localized clips", "Video ad spend is growing; scalable video creative is a near-term need for most agencies/adtech", "Monthly video production volume", "Do you produce video ad creatives at scale today, and what's your production pipeline?"),
+        ("VLM / OCR / Multimodal", "Creative QA, brand safety checks, asset tagging, ad copy inspection", "Brand safety and creative compliance are manual bottlenecks for large agencies", "Monthly creative assets reviewed", "Is creative QA or brand safety review a manual bottleneck today?"),
+        ("Model Platform", "Model routing, evaluation, API integration, cost/latency management", "Agencies and adtech platforms are evaluating multiple LLMs and need a managed API layer", "Monthly API calls and models evaluated", "What LLM or AI APIs do you use today, and how do you manage model selection and cost?"),
+    ],
+    "media_entertainment": [
+        ("Text / LLM", "Script assistance, caption generation, fan/community content, localization", "Content production volume is high; editorial and social teams benefit from AI text tools", "Content pieces per month", "Do editorial or social media teams use AI writing tools today?"),
+        ("Language / Localization", "Subtitle generation, dubbing prep, multi-language fan content, international release support", "Media companies release content across multiple markets and languages", "Markets and language pairs for releases", "How do you handle subtitling and localization for international releases today?"),
+        ("Image", "Poster/key visual creation, artist promo assets, album artwork concepts, campaign visual generation", "Music, film, and entertainment companies produce visual assets for every release", "Visual assets per campaign/release", "How are poster and key visual assets produced today, and what is the typical volume per release?"),
+        ("Video", "Artist promo clips, teaser/trailer generation, music video exploration, social video variants", "Short-form content and teasers are high-frequency needs for entertainment companies", "Teaser/promo clips per release", "How many short-form promos or teasers do you produce per release, and what is the production pipeline?"),
+        ("VLM / OCR / Multimodal", "Content review, asset tagging, video scene understanding, rights/brand compliance", "Large media libraries require automated content understanding and compliance checks", "Assets reviewed per month", "Is content review or asset tagging a manual bottleneck in your production or distribution workflow?"),
+        ("Model Platform", "Internal production tools, multi-model evaluation, API integration for creative workflows", "Media tech teams want a managed model layer for internal AI tools", "Internal API requests per month", "What AI models or APIs does your tech or production team use internally today?"),
+    ],
+    "ecommerce": [
+        ("Text / LLM", "Product copy, descriptions, SEO content, shopping assistant, recommendation text", "Product catalogue maintenance and SEO copy at scale benefit from LLM automation", "Product listings and copy updates per month", "How do you generate and update product descriptions at scale today?"),
+        ("Language / Localization", "Multi-market product copy, cross-border localization, customer support translation", "Cross-border ecommerce requires consistent localized product and support content", "Markets and SKUs needing localization", "How many markets do you sell in, and how is product localization managed today?"),
+        ("Image", "Product image generation, background replacement, SKU visual variation, try-on visuals", "Product image quality and variety directly impact conversion rates", "SKUs requiring visual variants per month", "How do you produce product images today, and is visual variation or background replacement a workflow?"),
+        ("Video", "Product demo videos, short-form commerce videos, ad creatives for paid media", "Short-form product video is a growing commerce channel", "Product videos produced per month", "Do you produce product demo or short-form commerce videos at scale?"),
+        ("VLM / OCR / Multimodal", "Catalog QA, product attribute extraction, visual search, image moderation", "Large catalogs need automated visual QA and attribute tagging", "SKUs in catalog requiring QA per month", "Is product catalog QA or attribute extraction a manual workflow today?"),
+        ("Model Platform", "Search and recommendation model management, AI API integration, cost optimization", "Ecommerce platforms run multiple models for search, ranking, and recommendations", "Monthly model API calls across functions", "What AI/ML models do you use for search, ranking, or personalization today?"),
+    ],
+    "gaming": [
+        ("Text / LLM", "NPC dialogue, narrative generation, in-game assistant, player support automation", "Game studios need dynamic text content and scalable player support", "NPCs requiring dialogue or support tickets per month", "Do you use AI for NPC dialogue, narrative scripting, or player support automation today?"),
+        ("Language / Localization", "Game localization across markets, in-game text translation, community content", "Games launch across multiple markets and require rapid localization", "Languages and markets for upcoming title", "How many languages and markets do you localize for, and what is the localization pipeline?"),
+        ("Image", "Game asset generation (concept art, item visuals, UI elements, key art), marketing creative", "Asset production is a bottleneck in game development; AI can accelerate iteration", "Art assets produced per sprint/release", "What is your current concept art or game asset production workflow, and where are the bottlenecks?"),
+        ("Video", "Game trailers, cutscene drafts, marketing video, player-generated content review", "Trailers and marketing video are high-cost, high-frequency outputs for game releases", "Trailers and marketing videos per year", "How are game trailers and marketing videos produced today?"),
+        ("VLM / OCR / Multimodal", "Content moderation, asset QA, visual compliance, in-game screenshot understanding", "Live-service games need scalable content moderation and asset compliance", "Monthly moderation decisions or QA assets", "How do you handle content moderation and asset QA for live-service games today?"),
+        ("Model Platform", "Model API management, evaluation for game AI features, cost/latency optimization", "Studios building AI features need a managed model platform", "Monthly model API calls for game AI features", "What AI/ML APIs does your engineering team use for in-game features today?"),
+    ],
+    "ai_video_creative": [
+        ("Text / LLM", "Creative brief generation, prompt engineering, script-to-video workflow, internal tools", "Creative platform teams build LLM-integrated workflows for brief and prompt automation", "Prompt generation requests per month", "Do you have LLM-integrated workflows for brief or prompt generation today?"),
+        ("Language / Localization", "Multi-language prompt handling, subtitle generation, localized creative exports", "Creative platforms with global users need localized content pipelines", "Languages and markets served", "How many languages and markets do your customers generate content for?"),
+        ("Image", "Reference frame generation, storyboard creation, thumbnail and still production", "Image generation is often part of the pre-production and exploration pipeline", "Images generated per day/month", "What is your current image generation volume, and is Seedream or a comparable model used today?"),
+        ("Video", "Main platform workload — short-form generation, editing, batch production, API pipeline", "Video generation is the core platform workload for AI creative companies", "Videos generated per day/month, API call volume", "What is your daily and monthly video generation volume, and what quality/latency benchmarks matter?"),
+        ("VLM / OCR / Multimodal", "Quality scoring, consistency checks, temporal coherence validation, asset inspection", "Automated QA at video generation scale is a platform-level need", "Videos QA'd per month", "Is quality scoring or automated QA part of your current pipeline, and what metrics matter?"),
+        ("Model Platform", "Model evaluation, routing, API cost management, provider benchmarking", "AI creative platforms evaluate and switch models frequently", "Models benchmarked per quarter, API cost per generation", "How do you evaluate and select generation models today, and what is the decision process?"),
+    ],
+    "enterprise_llm": [
+        ("Text / LLM", "Internal assistant, RAG workflows, knowledge management, process automation", "Enterprise AI is the core workload — internal tools, assistants, and workflow automation", "Daily active users and document queries per month", "What internal AI assistant or RAG workflow are you building, and how many users will it serve?"),
+        ("Language / Localization", "Multi-language enterprise content, cross-border team tools, global deployment", "Global enterprises need multi-language AI tools for international teams", "Languages and regions for deployment", "Do you need multi-language support for internal AI tools or customer-facing deployments?"),
+        ("Image", "Document visual understanding, presentation/report generation (conditional on team)", "Image generation is less central unless there is a marketing or content team involved", "Image generation requests per month (if applicable)", "Does any team have image generation or document visual processing needs?"),
+        ("Video", "Optional — only if content or marketing team is in scope", "Video generation is conditional on whether content production teams are part of the discussion", "Video generation use case to confirm", "Is there a video content or marketing team involved in this evaluation?"),
+        ("VLM / OCR / Multimodal", "Document understanding, OCR, form processing, visual data extraction, compliance", "Enterprise VLM/OCR is a high-frequency workload for document-heavy industries", "Documents processed per month, OCR accuracy requirements", "Do you have document processing, OCR, or visual data extraction workflows that need AI today?"),
+        ("Model Platform", "Main workload — model gateway, multi-model routing, governance, cost/latency management", "Enterprises need a managed model platform with governance, routing, and cost controls", "Monthly model API calls, number of models in evaluation", "What is your current model stack, and how do you manage model selection, routing, and cost today?"),
+    ],
+    "consumer_technology": [
+        ("Text / LLM", "Internal developer tools, product assistant, customer support automation, API integration", "Consumer tech companies are heavy API consumers and often build internal AI tooling", "Daily internal API calls and developer/product tool users", "What internal AI tools or developer-facing APIs are you building or evaluating today?"),
+        ("Language / Localization", "Multi-language product and content support, global app localization", "Consumer tech products often target global markets and need localization at scale", "Languages and markets in product roadmap", "How many markets do you serve, and how is AI-driven localization handled today?"),
+        ("Image", "Conditional — product launch assets, marketing campaigns, if marketing team is in scope", "Image generation is relevant when marketing or product-launch teams are part of the discussion", "Image generation volume (if applicable)", "Is marketing or product-launch visual content part of this evaluation, or is the focus on engineering/product?"),
+        ("Video", "Conditional — product demos, marketing clips, if content team is in scope", "Video generation is relevant when content or marketing teams are in scope", "Video generation use case to confirm", "Is there a video content or product-demo team involved in this evaluation?"),
+        ("VLM / OCR / Multimodal", "UI screenshot understanding, visual inspection, app QA, accessibility automation, device diagnostics", "Consumer tech companies often have visual inspection, QA, or accessibility workflows that benefit from VLM/multimodal", "Screenshots or UI frames processed per day/month", "Do you have UI testing, visual inspection, or accessibility workflows that could benefit from visual AI today?"),
+        ("Model Platform", "Model routing and evaluation, multi-model governance, inference API, developer platform integration", "Consumer tech companies building AI products need a managed model layer", "Monthly model API calls, models in evaluation", "What model APIs or platforms does your engineering team use today, and how do you manage routing and cost?"),
+    ],
+}
+
+_VERTICAL_COMPETITOR_CATEGORIES: dict[str, list[str]] = {
+    "marketing_adtech": [
+        "OpenAI (GPT-4o, o3, API)", "Anthropic (Claude)", "Google Gemini / Vertex AI",
+        "Azure OpenAI", "AWS Bedrock", "Adobe Firefly / Creative Cloud",
+        "Runway / Pika / Luma (video generation)", "HeyGen / Synthesia (avatar video)",
+        "Midjourney / Stability AI / Leonardo (image generation)", "Fal.ai / Replicate (API inference)",
+    ],
+    "media_entertainment": [
+        "Runway / Pika / Luma / Kling (video generation)", "Adobe Firefly / Premiere (creative tools)",
+        "Midjourney / Stability AI (image generation)", "HeyGen / Synthesia (avatar/promo video)",
+        "OpenAI / Google Gemini (LLM + vision)", "Local production tools and agencies",
+    ],
+    "ecommerce": [
+        "OpenAI (GPT + vision API)", "Anthropic (Claude)", "Google Gemini / Vertex AI",
+        "Azure OpenAI / AWS Bedrock", "Adobe Firefly (product image editing)",
+        "Midjourney / Stability AI / Leonardo (image generation)", "Runway / Pika (product video)",
+        "Google Cloud Vision / AWS Rekognition (catalog QA / visual search)",
+    ],
+    "gaming": [
+        "Midjourney / Stability AI / Leonardo (concept art and game assets)",
+        "Runway / Pika / Luma (cinematic / trailer video)", "OpenAI (GPT for NPC and support)",
+        "Anthropic (Claude for narrative AI)", "Google Vertex AI / Gemini", "Azure OpenAI",
+        "Internal AI tooling and research teams",
+    ],
+    "ai_video_creative": [
+        "Runway (Gen-3/Gen-4 video generation)", "Pika Labs", "Luma AI (Dream Machine)",
+        "Kling AI", "Sora (OpenAI)", "Adobe Premiere / After Effects",
+        "CapCut / Jianying (consumer video editing)", "HeyGen / Synthesia (avatar video)",
+        "Midjourney / Stability AI / FLUX (image-to-video pipeline)", "Fal.ai / Replicate (API inference)",
+    ],
+    "enterprise_llm": [
+        "OpenAI (GPT-4o, o3, Enterprise API)", "Anthropic (Claude Enterprise)",
+        "Google Gemini / Vertex AI (enterprise)", "Azure OpenAI Service", "AWS Bedrock",
+        "Internal / proprietary model platform", "Cohere / Mistral / LLaMA (open-weight options)",
+        "Databricks / Snowflake (data + AI platform integration)",
+    ],
+    "consumer_technology": [
+        "OpenAI (API + enterprise)", "Anthropic (Claude API)", "Google Gemini / Vertex AI",
+        "Azure OpenAI", "AWS Bedrock", "Internal model platform / research team",
+        "OCR / VLM providers (Google Vision, AWS Textract, Azure AI Vision)",
+        "Developer tooling providers (Hugging Face, Replicate, Fal.ai)",
+    ],
+}
+
+_VERTICAL_SOLUTION_PATHS: dict[str, list[dict]] = {
+    "marketing_adtech": [
+        {"name": "A. Creative generation and localization", "products": "Seedance (video) + Seedream (image)", "why": "High-volume creative production and variant testing is a core workflow for performance agencies and adtech platforms", "validate": "Creative production volume per client/campaign, current tools, brand/quality bar, market scope, approval workflow", "poc": "Generate image/video variants for one live campaign — compare generation speed, quality, approval rate, and cost vs current workflow"},
+        {"name": "B. AI model platform and workflow", "products": "Ark", "why": "Agencies and adtech platforms are evaluating multiple LLMs and need API-level model routing, cost management, and integration", "validate": "Current model stack (OpenAI/Anthropic/Gemini/Azure), API call volume, latency requirements, cost sensitivity, evaluation timeline", "poc": "Route a sample of campaign assistant or copy-generation queries through Ark — compare quality, latency, and cost vs current stack"},
+        {"name": "C. Creative QA and brand safety automation", "products": "VLM / multimodal", "why": "Manual creative review and brand safety checks are bottlenecks at scale", "validate": "Monthly volume of creative assets reviewed, current review process, brand safety requirements, compliance standards", "poc": "Run VLM-based classification on a sample set of creative assets — measure accuracy vs manual review and time saved"},
+    ],
+    "media_entertainment": [
+        {"name": "A. Visual content production for releases and campaigns", "products": "Seedream (image) + Seedance (video)", "why": "Entertainment companies produce high-frequency visual assets for every release cycle", "validate": "Visual asset volume per release, current production workflow, quality and brand standards, campaign timeline", "poc": "Generate poster/key visual or teaser clip for an upcoming release — compare creative exploration speed and asset quality"},
+        {"name": "B. Content understanding and automated review", "products": "VLM / multimodal", "why": "Large media libraries and streaming catalogs need automated content understanding and compliance", "validate": "Library size, content moderation or tagging workflow, rights/compliance requirements, review volume", "poc": "Tag and classify a sample of catalog assets — measure tagging accuracy and time saved vs manual workflow"},
+        {"name": "C. Internal AI tools and model platform", "products": "Ark", "why": "Media tech teams want a managed model layer for internal editorial, production, and fan/community tools", "validate": "Internal AI tool roadmap, current model APIs, team size and use cases, governance requirements", "poc": "Deploy a model routing or internal assistant prototype — evaluate latency, quality, and governance controls"},
+    ],
+    "ecommerce": [
+        {"name": "A. Product image generation and visual variation", "products": "Seedream (image)", "why": "Product image quality and visual variety directly impact conversion; background removal/replacement and SKU variation are high-frequency workflows", "validate": "SKU count needing visual refreshes, current image production workflow, background replacement volumes, quality standard", "poc": "Generate visual variants for a sample SKU set — compare generation speed, image quality, and cost vs current tooling"},
+        {"name": "B. Short-form product and commerce video", "products": "Seedance (video)", "why": "Short-form product video is a growing channel for ecommerce; automated generation reduces production cost", "validate": "Monthly product video volume, social/commerce channels served, current video production workflow", "poc": "Generate product demo clips for a sample product line — evaluate creative quality, production time, and cost"},
+        {"name": "C. AI shopping assistant and catalog intelligence", "products": "Ark + VLM", "why": "AI-powered search, recommendation, and catalog QA are high-value ecommerce AI workloads", "validate": "Catalog size, current search/recommendation stack, product attribute extraction workflow, model APIs in use", "poc": "Prototype a catalog QA or shopping assistant workflow — compare attribute extraction accuracy and latency"},
+    ],
+    "gaming": [
+        {"name": "A. Game asset and concept art generation", "products": "Seedream (image)", "why": "Asset production is a bottleneck in game development; AI image generation accelerates concept art and in-game asset iteration", "validate": "Art asset production volume, current workflow (in-house artists vs outsourcing), quality and style consistency bar, engine integration needs", "poc": "Generate concept art or item visuals for one game title — compare iteration speed, style consistency, and cost vs current process"},
+        {"name": "B. Trailer and marketing video generation", "products": "Seedance (video)", "why": "Game trailers and marketing video are high-cost, high-frequency outputs; AI video can accelerate pre-production and marketing variants", "validate": "Annual trailer/marketing video volume, current production pipeline, quality bar, approvals workflow", "poc": "Generate a rough-cut trailer variant for an upcoming title — evaluate creative quality, iteration speed, and feedback from the creative team"},
+        {"name": "C. NPC AI, player support, and content moderation", "products": "Ark + VLM", "why": "Live-service games need scalable NPC dialogue, player support automation, and content moderation", "validate": "Player support ticket volume, NPC dialogue system, moderation review volume, current AI/ML APIs", "poc": "Prototype NPC dialogue or support automation — measure response quality and resolution rate vs current solution"},
+    ],
+    "ai_video_creative": [
+        {"name": "A. Video generation quality and throughput benchmarking", "products": "Seedance (video)", "why": "AI creative platforms evaluate models on quality, consistency, speed, and cost at generation scale", "validate": "Daily/monthly generation volume, current model provider (Runway/Pika/Luma/Kling/Sora), quality benchmark criteria, API cost sensitivity", "poc": "Generate a batch of videos across standard prompt types — compare visual quality, temporal consistency, latency, and cost per generation"},
+        {"name": "B. Image generation and creative pipeline", "products": "Seedream (image)", "why": "Image generation is often part of the exploration and pre-production pipeline for video platforms", "validate": "Image generation volume, current model (Midjourney/Stability/FLUX), use in pre-production vs final output, API integration needs", "poc": "Benchmark image generation quality across a standard creative brief — compare aesthetic quality, style adherence, and API latency"},
+        {"name": "C. Model evaluation and API routing platform", "products": "Ark", "why": "Creative platforms evaluate and switch models frequently; a managed API layer reduces switching cost and enables cost optimization", "validate": "Number of models evaluated per quarter, API cost per generation, routing or evaluation workflow, governance requirements", "poc": "Route a sample of generation requests through Ark — compare routing accuracy, cost savings, and API management overhead"},
+    ],
+    "enterprise_llm": [
+        {"name": "A. Enterprise AI gateway and model platform", "products": "Ark", "why": "Enterprises need a managed model platform with routing, governance, access control, and cost management", "validate": "Current model stack (OpenAI/Anthropic/Gemini/Azure/Bedrock), monthly API call volume, governance and compliance requirements, team size", "poc": "Deploy Ark as the model gateway for an internal use case — evaluate routing accuracy, cost reduction, and governance controls"},
+        {"name": "B. Document and visual intelligence (VLM / OCR)", "products": "VLM / OCR (Ark multimodal)", "why": "Document processing, OCR, and visual data extraction are high-frequency enterprise workflows", "validate": "Document volume per month, current OCR/document processing stack, accuracy requirements, language/format diversity", "poc": "Process a sample document batch through VLM/OCR — compare extraction accuracy, processing speed, and cost vs current solution"},
+        {"name": "C. Creative and content generation (conditional)", "products": "Seedream (image) / Seedance (video) — only if marketing or content teams are in scope", "why": "If marketing or content production teams are part of the evaluation, image/video generation is a possible extension workload", "validate": "Whether marketing, brand, or content team is part of this evaluation and has active creative production needs", "poc": "Scope only after confirming marketing/content team involvement and creative production volume"},
+    ],
+    "consumer_technology": [
+        {"name": "A. Model platform, API routing, and evaluation", "products": "Ark", "why": "Consumer tech companies building AI products are heavy API consumers and need a managed model platform for routing, evaluation, and cost control", "validate": "Current model APIs in use, monthly call volume, latency/cost requirements, number of models being evaluated, governance needs", "poc": "Integrate Ark as the model routing layer for one internal AI product — evaluate latency, quality, cost savings, and developer experience"},
+        {"name": "B. VLM / OCR / multimodal integration", "products": "VLM (Ark multimodal)", "why": "Consumer tech products often have visual inspection, UI understanding, or accessibility workflows that benefit from multimodal AI", "validate": "Whether there are UI testing, visual inspection, OCR, or accessibility workflows; volume of screenshots/images processed; current solution", "poc": "Run VLM on a sample of UI screenshots or device images — measure understanding accuracy and latency vs current approach"},
+        {"name": "C. Image and video generation (conditional)", "products": "Seedream (image) / Seedance (video)", "why": "Image and video generation are relevant when marketing, content, or product-launch teams are part of the discussion", "validate": "Whether marketing, brand, or product-launch team is in scope; creative production volume; current tooling", "poc": "Scope only after confirming which team is driving the evaluation and confirming creative production needs"},
+    ],
+}
+
+_VERTICAL_FIRST_MEETING_QUESTIONS: dict[str, list[dict]] = {
+    "marketing_adtech": [
+        {"q": "Which team is this discussion for — media buying, creative, adtech product, data/insights, or marketing operations?", "why": "Different teams have different BytePlus workloads (Ark for insights/models, Seedance/Seedream for creative, VLM for brand safety)", "unlocks": "Correctly scopes which BytePlus product and use case is most relevant", "followup": "Who else from technical and commercial ownership should be part of this evaluation?"},
+        {"q": "What AI tools, APIs, or models does your team use today for creative, copy, or campaign workflows?", "why": "Identifies current vendors and switching opportunities", "unlocks": "Competitor/vendor intelligence and differentiation angles", "followup": "What do you like or dislike about your current solution?"},
+        {"q": "What is your approximate monthly volume — ad creatives generated, campaigns served, API calls, or content pieces produced?", "why": "Volume is the key sizing input for commercial discussions", "unlocks": "Commercial model and POC scope", "followup": "Is that volume growing, and what is driving the growth?"},
+        {"q": "Which creative formats matter most today: image, video, copy, or multi-format bundles?", "why": "Determines which BytePlus product (Seedance, Seedream, Ark) is most relevant as the starting point", "unlocks": "Product prioritization and POC design", "followup": "Is video ad creative a current priority, or is that a future roadmap item?"},
+        {"q": "What markets and languages are in scope for creative and campaign production?", "why": "Localization scale affects image/video generation ROI", "unlocks": "Localization use case and multi-market creative opportunity", "followup": "How is localization handled today — in-house, agency, or automated?"},
+        {"q": "What would make a POC successful — speed, cost reduction, quality improvement, or something else?", "why": "Defines success criteria for the commercial discussion", "unlocks": "POC design and benchmark criteria", "followup": "Is there a specific campaign, client, or timeline we could benchmark against?"},
+        {"q": "What is the current AI or creative tool budget, and who owns the vendor decision?", "why": "Identifies commercial path and decision owner", "unlocks": "Budget qualification and next-step planning", "followup": "Is there an existing vendor contract expiring, or are you evaluating net-new tooling?"},
+    ],
+    "media_entertainment": [
+        {"q": "Which team is this discussion for — content production, artist/label relations, distribution, tech/engineering, or marketing?", "why": "Production teams need image/video generation; tech teams need model platform; marketing needs creative generation", "unlocks": "Scopes the correct BytePlus product and use case", "followup": "Who else from technical and commercial ownership should be part of this evaluation?"},
+        {"q": "What is your release cadence — how many titles, albums, or campaigns per month require visual or video assets?", "why": "Release cadence determines creative production volume and ROI", "unlocks": "Volume sizing and commercial model", "followup": "What does the current production workflow look like for these releases?"},
+        {"q": "What AI or creative tools are used today for visual asset production or content generation?", "why": "Identifies current vendor stack and switching opportunity", "unlocks": "Competitor/vendor intelligence and differentiation", "followup": "What quality or workflow limitations have you encountered with current tools?"},
+        {"q": "Are you looking at AI for content creation, content understanding (tagging/review/search), or both?", "why": "Creation maps to Seedream/Seedance; understanding maps to VLM", "unlocks": "Correct product scoping and POC design", "followup": "Is there a specific release or library project we could use as a POC?"},
+        {"q": "What markets and languages are in scope for releases and campaigns?", "why": "International releases require localization; multi-market determines scale", "unlocks": "Localization opportunity and global scope", "followup": "How is localization handled today — in-house, external agency, or automated?"},
+        {"q": "What would a successful pilot look like, and who owns the go/no-go decision?", "why": "Success criteria and decision owner are required for commercial qualification", "unlocks": "POC criteria and next steps", "followup": "Is there an upcoming release where we could run a benchmark?"},
+    ],
+    "ecommerce": [
+        {"q": "Which team is this discussion for — product catalog, marketing, engineering/data, or operations?", "why": "Catalog teams need image generation; marketing needs video/creative; engineering needs model platform", "unlocks": "Product and use case prioritization", "followup": "Who else should be part of this evaluation on the technical and commercial side?"},
+        {"q": "How many SKUs or products require visual refreshes, new imagery, or video per month?", "why": "SKU volume is the key input for image/video generation ROI", "unlocks": "Commercial model and POC scope", "followup": "Is there a seasonal spike that drives higher creative volume?"},
+        {"q": "What AI or creative tools are you using today for product image, video, or copy generation?", "why": "Identifies current stack and switching opportunity", "unlocks": "Vendor intelligence and differentiation angles", "followup": "What are the main pain points with your current workflow?"},
+        {"q": "How many markets and languages do you sell in, and how is localization handled today?", "why": "Cross-border ecommerce with localized content is a strong image/video generation use case", "unlocks": "Localization scale and multi-market opportunity", "followup": "Is localization a manual or automated workflow today?"},
+        {"q": "Is catalog QA or product attribute extraction a manual workflow today?", "why": "VLM/multimodal automation for catalog QA is a high-ROI use case for large catalogs", "unlocks": "VLM opportunity and automation scope", "followup": "What is the approximate catalog size and monthly QA volume?"},
+        {"q": "What would make a POC successful — image quality, generation speed, cost reduction, or catalog accuracy?", "why": "Success criteria drive POC design and commercial qualification", "unlocks": "Benchmark criteria and next step", "followup": "Is there a specific product category or campaign we could use as a benchmark?"},
+    ],
+    "gaming": [
+        {"q": "Which team is this discussion for — game development/art, live operations, player support, marketing, or tech/engineering?", "why": "Art team needs image generation; live ops needs NPC/support AI; marketing needs video/creative", "unlocks": "Correct product and use case scoping", "followup": "Who else should be involved from technical and commercial decision-making?"},
+        {"q": "What is the production volume — art assets per sprint, marketing videos per year, or support tickets per month?", "why": "Volume determines ROI and commercial model", "unlocks": "Sizing and commercial scope", "followup": "Is there an upcoming title where we could run a pilot?"},
+        {"q": "What AI tools or APIs does your team use today for art, NPC, support, or marketing?", "why": "Identifies current vendor stack and competitive positioning", "unlocks": "Vendor intelligence and differentiation", "followup": "What limitations have you encountered with the current tools?"},
+        {"q": "How many markets and languages do you launch in, and how is localization managed today?", "why": "Game localization at launch is a high-volume multilingual content workload", "unlocks": "Localization opportunity and multi-market scope", "followup": "Is AI localization or translation in your current or roadmap workflow?"},
+        {"q": "Is content moderation or asset QA a current bottleneck for your live-service title?", "why": "VLM-based moderation and QA automation is a meaningful workload for live-service games", "unlocks": "VLM opportunity and automation scope", "followup": "What is the monthly moderation or review volume?"},
+        {"q": "What would a successful POC look like — asset quality, generation speed, support deflection, or moderation accuracy?", "why": "Success criteria are required for commercial qualification", "unlocks": "POC design and benchmark criteria", "followup": "Is there a title launch or live-service milestone we could benchmark against?"},
+    ],
+    "ai_video_creative": [
+        {"q": "What is your daily and monthly video generation volume today, and what are your peak concurrency needs?", "why": "Volume and concurrency are the primary sizing inputs for a creative platform deal", "unlocks": "Commercial model and infrastructure scope", "followup": "Is that volume growing rapidly, and what is the growth driver?"},
+        {"q": "Which generation model do you use today — Runway, Pika, Luma, Kling, Sora, or others?", "why": "Identifies current vendor and switching opportunity; Seedance benchmarking is the POC path", "unlocks": "Competitive positioning and switching motivation", "followup": "What do you like or dislike about your current model?"},
+        {"q": "What quality benchmark criteria matter most — visual quality, temporal consistency, style adherence, diversity, or cost per generation?", "why": "Quality benchmark criteria define the POC evaluation framework", "unlocks": "POC design and differentiation angles", "followup": "Do you have a standard test prompt set we could benchmark against?"},
+        {"q": "What is the typical prompt type — text-to-video, image-to-video, reference-based, or style-guided?", "why": "Prompt type determines which Seedance capabilities are most relevant", "unlocks": "Product capability alignment and POC scope", "followup": "Do your users submit prompts directly via API, or through a platform UI?"},
+        {"q": "Is image generation part of your pipeline today, and which model do you use?", "why": "Seedream integration alongside Seedance is a natural expansion opportunity", "unlocks": "Image generation expansion opportunity", "followup": "What is the image generation volume relative to video generation?"},
+        {"q": "Who owns the model selection and vendor decision — engineering, product, or commercial leadership?", "why": "Decision owner determines next step and commercial path", "unlocks": "Stakeholder map and procurement process", "followup": "Is there an existing API contract expiring, or is this a new evaluation?"},
+    ],
+    "enterprise_llm": [
+        {"q": "What is the priority use case — internal assistant/RAG, process automation, document intelligence, or customer-facing AI?", "why": "Use case determines the correct BytePlus product and architecture", "unlocks": "Product scoping and POC design", "followup": "Is there an existing proof-of-concept or in-production tool we can benchmark against?"},
+        {"q": "What model stack are you using today — OpenAI, Anthropic, Gemini, Azure OpenAI, AWS Bedrock, or internal models?", "why": "Current stack identifies switching opportunity and Ark integration path", "unlocks": "Vendor intelligence and Ark positioning", "followup": "What are the main cost, latency, or governance challenges with your current stack?"},
+        {"q": "What is the approximate monthly model API call volume, and how many teams or applications are using AI today?", "why": "Volume and team breadth are the primary commercial sizing inputs", "unlocks": "Commercial model and Ark platform scope", "followup": "Is that volume growing as you roll out AI to more teams?"},
+        {"q": "Do you have document processing, OCR, or visual data extraction workflows that need AI?", "why": "VLM/OCR is a high-frequency enterprise workload; confirms or rules out the multimodal path", "unlocks": "VLM opportunity scope", "followup": "What is the monthly document volume, and what accuracy requirements apply?"},
+        {"q": "What are the governance, compliance, and data residency requirements for your AI deployment?", "why": "Enterprise AI governance is often a key differentiator and blocker", "unlocks": "Deployment architecture and compliance positioning", "followup": "Do you need on-premise, private cloud, or VPC deployment options?"},
+        {"q": "Who owns the technical and commercial decision for AI platform selection?", "why": "Decision owner determines the commercial path and approval process", "unlocks": "Stakeholder map and procurement process", "followup": "Is there an existing enterprise AI contract expiring, or is this a new procurement?"},
+    ],
+    "consumer_technology": [
+        {"q": "Which team is this discussion for — product, developer platform, AI/ML research, marketing, content, or operations?", "why": "Different teams have different BytePlus workloads: Ark for product/developer, VLM for QA/inspection, Seedream/Seedance conditional on marketing", "unlocks": "Correctly scopes which BytePlus product and use case is relevant", "followup": "Who else from technical and commercial decision-making should be involved?"},
+        {"q": "Is the priority internal AI tooling, model API infrastructure, multimodal/visual QA, or external creative/product marketing workflows?", "why": "Priority determines whether Ark, VLM, or creative products are most relevant", "unlocks": "Product prioritization and POC design", "followup": "Is there a specific product feature or internal tool we could benchmark against?"},
+        {"q": "What model APIs or platforms does your engineering team use today?", "why": "Identifies current stack and Ark integration opportunity", "unlocks": "Vendor intelligence and switching motivation", "followup": "What are the main pain points with your current model stack — cost, latency, governance, or capability?"},
+        {"q": "What is the approximate monthly model API call volume, and how many applications or teams are using AI?", "why": "Volume and breadth are the primary commercial sizing inputs", "unlocks": "Commercial model and Ark platform scope", "followup": "Is that growing rapidly as you add AI to more products?"},
+        {"q": "Do you have UI testing, visual inspection, accessibility, or device diagnostic workflows that could benefit from visual AI?", "why": "VLM/multimodal is a natural fit for consumer tech companies with device or app ecosystems", "unlocks": "VLM opportunity scope", "followup": "What is the volume of screenshots or UI frames processed in QA today?"},
+        {"q": "What success metric matters most for a POC — model quality, inference latency, cost reduction, governance, or developer experience?", "why": "Success criteria are required for commercial qualification", "unlocks": "POC design and evaluation criteria", "followup": "Is there a specific product milestone or evaluation deadline we should align to?"},
+    ],
+}
+
+_VERTICAL_AE_SA_VIEWS: dict[str, dict] = {
+    "marketing_adtech": {
+        "ae_why": "Marketing and adtech companies have high-volume creative and AI workloads across campaign production, performance optimization, and data/insights. BytePlus can address creative generation (Seedance/Seedream), model API platform (Ark), and creative QA (VLM).",
+        "ae_pain": ["Possible: scaling creative production for growing client or market volume", "Possible: managing multi-model API cost and quality across campaigns", "Possible: automating brand safety and creative QA reviews"],
+        "ae_stakeholders": "Creative/production lead, Head of AI/ML, CTO/CPO, Head of Performance Marketing, commercial decision owner",
+        "ae_budget": "What is the current AI tools or creative production budget? Is there an existing vendor contract expiring? Who approves AI platform spend?",
+        "ae_next": "Agree on which team/use case to scope first; design a POC benchmark for one campaign or workflow; confirm decision owner.",
+        "sa_workload": ["Possible: LLM-based campaign copy, briefing, or insights (Ark / model platform)", "Possible: image ad creative generation at campaign scale (Seedream)", "Possible: video ad creative generation (Seedance)", "Possible: creative QA / brand safety automation (VLM)"],
+        "sa_stack": "Ask: current LLM/image/video APIs (OpenAI/Anthropic/Adobe Firefly/Runway/Midjourney?), API call volume, latency/cost requirements, existing integrations",
+        "sa_volume": "Monthly creative variants, API calls, video/image generations, QA assets reviewed per month",
+        "sa_integration": "API integration method (REST/SDK), data residency/compliance requirements, CI/CD or workflow integration, authentication and access control",
+        "sa_poc": "API benchmark: generate image/video variants for one campaign prompt set and compare quality, cost, latency vs current tool. Or model routing: route copy/insights queries through Ark and compare cost and quality.",
+    },
+    "media_entertainment": {
+        "ae_why": "Entertainment companies produce high-frequency visual and video assets for releases, campaigns, and library management. BytePlus addresses visual content production (Seedream/Seedance), content intelligence (VLM), and internal AI tools (Ark).",
+        "ae_pain": ["Possible: high cost and slow turnaround for visual asset production per release", "Possible: manual content review and tagging bottleneck for large media libraries", "Possible: lack of internal AI tooling for production or editorial teams"],
+        "ae_stakeholders": "Head of Content/Production, CTO/Head of Tech, Artist/Label Relations lead (if music), commercial decision owner",
+        "ae_budget": "What is the current visual production or agency budget? Is there a content tech budget? Who approves AI tool spend?",
+        "ae_next": "Identify one upcoming release as a POC opportunity; confirm which team and workload to scope first; agree on benchmark criteria.",
+        "sa_workload": ["Possible: image generation for poster/key visual or album art (Seedream)", "Possible: video generation for artist promos, teasers, or social clips (Seedance)", "Possible: content review, tagging, and compliance automation (VLM)", "Possible: internal model platform for editorial or production tools (Ark)"],
+        "sa_stack": "Ask: current visual production tools (Adobe/Midjourney/Runway?), content management stack, AI/ML APIs, on-premise or cloud deployment needs",
+        "sa_volume": "Visual assets produced per release/campaign, video/promo clips per month, library size for content review",
+        "sa_integration": "Integration with content management or DAM system, rights/compliance requirements, data residency needs, API method",
+        "sa_poc": "Image/video generation for an upcoming release: generate key visual or promo clip variants and benchmark against current production workflow on quality, speed, and cost.",
+    },
+    "ecommerce": {
+        "ae_why": "Ecommerce companies need scalable product image/video production and AI-driven catalog intelligence. BytePlus addresses image generation (Seedream), video generation (Seedance), and catalog/search AI (Ark + VLM).",
+        "ae_pain": ["Possible: slow and expensive product image refresh and SKU visual variation", "Possible: manual catalog QA and attribute extraction at scale", "Possible: growing demand for short-form product video for commerce channels"],
+        "ae_stakeholders": "Head of Product/Catalog, Head of Marketing, CTO/Head of Engineering, commercial decision owner",
+        "ae_budget": "Current creative production or catalog management budget? AI tool spend? Vendor contract expiries?",
+        "ae_next": "Identify one product category or campaign for a visual generation POC; confirm catalog or marketing team as primary owner.",
+        "sa_workload": ["Possible: product image generation and background replacement (Seedream)", "Possible: product demo or commerce video generation (Seedance)", "Possible: catalog QA and attribute extraction (VLM)", "Possible: AI shopping assistant and search optimization (Ark + VLM)"],
+        "sa_stack": "Ask: current product image workflow (in-house/agency/Adobe Firefly?), catalog management system, current AI/ML APIs, video production stack",
+        "sa_volume": "Monthly SKU visual refreshes, product videos produced, catalog QA reviews, API calls for search/recommendation",
+        "sa_integration": "Integration with catalog system or PIM, CDN and image delivery requirements, data residency, API authentication",
+        "sa_poc": "Image generation: generate visual variants for a sample SKU set and compare quality, speed, and cost. Or VLM catalog QA: run attribute extraction on a sample catalog subset.",
+    },
+    "gaming": {
+        "ae_why": "Gaming companies produce large volumes of art assets, marketing content, and live-service AI workloads. BytePlus addresses asset generation (Seedream), marketing video (Seedance), and NPC/support/moderation (Ark + VLM).",
+        "ae_pain": ["Possible: high art asset production cost and slow iteration in development", "Possible: expensive and slow game trailer and marketing video production", "Possible: scaling player support and content moderation for live-service titles"],
+        "ae_stakeholders": "Art Director / Head of Development, Head of Marketing, Head of Live Operations, CTO, commercial decision owner",
+        "ae_budget": "Current art/production or marketing budget? AI tool spend for the studio? Existing vendor contracts?",
+        "ae_next": "Identify one title or workflow as a POC opportunity; confirm whether art, marketing, or live ops is the priority team.",
+        "sa_workload": ["Possible: game concept art and asset generation (Seedream)", "Possible: trailer and marketing video generation (Seedance)", "Possible: NPC dialogue and narrative AI (Ark)", "Possible: player support automation (Ark)", "Possible: content moderation and asset QA (VLM)"],
+        "sa_stack": "Ask: current art tooling (Midjourney/Stability/in-house?), video production pipeline, AI/ML APIs for in-game features, support and moderation stack",
+        "sa_volume": "Art assets per sprint, trailers/marketing videos per year, support tickets per month, moderation decisions per month",
+        "sa_integration": "Game engine integration (Unity/Unreal/custom?), cloud vs on-premise, data residency, API method and concurrency",
+        "sa_poc": "Asset generation: produce concept art or item visuals for one game title and benchmark iteration speed, style consistency, and cost.",
+    },
+    "ai_video_creative": {
+        "ae_why": "AI creative platforms are core BytePlus targets. Seedance (video generation) and Seedream (image generation) directly address the platform's generation workload, with Ark for model routing and evaluation.",
+        "ae_pain": ["Possible: current generation model quality or consistency not meeting platform bar", "Possible: API cost or latency constraints limiting volume or monetization", "Possible: frequent model re-evaluation creating switching overhead"],
+        "ae_stakeholders": "CTO/Head of Engineering, Head of Product, commercial decision owner",
+        "ae_budget": "Current generation API cost per month? Existing provider contracts and expiry? Evaluation timeline?",
+        "ae_next": "Run a quality and cost benchmark against current generation model; share Seedance API access and benchmark prompt set.",
+        "sa_workload": ["Possible: video generation quality and throughput (Seedance — main workload)", "Possible: image generation pipeline integration (Seedream)", "Possible: model evaluation and API routing (Ark)"],
+        "sa_stack": "Ask: current generation model (Runway/Pika/Luma/Kling/Sora?), API call volume, latency SLA, cost per generation, prompt type distribution",
+        "sa_volume": "Daily/monthly video generations, peak concurrency, image generation volume, API error rate and retry volume",
+        "sa_integration": "REST/gRPC API, async job queue vs synchronous, output format/resolution requirements, CDN/storage integration, authentication",
+        "sa_poc": "Benchmark Seedance against current provider: generate a standard batch of prompts, measure visual quality, temporal consistency, latency P50/P95, and cost per generation.",
+    },
+    "enterprise_llm": {
+        "ae_why": "Enterprise AI platform deals are high-value. Ark is the primary BytePlus product for model gateway, routing, and governance. VLM/OCR is the secondary workload for document intelligence.",
+        "ae_pain": ["Possible: high and growing LLM API cost across multiple teams and applications", "Possible: lack of governance, access control, or audit trail for AI tool usage", "Possible: multi-vendor model management complexity and switching overhead"],
+        "ae_stakeholders": "CTO / Head of AI Platform, Head of Engineering, CISO/Compliance lead, commercial decision owner",
+        "ae_budget": "Current AI infrastructure or model API spend? Existing enterprise contracts (OpenAI/Azure/AWS)? Procurement timeline?",
+        "ae_next": "Confirm priority use case and team; design a model routing or document intelligence POC; map the approval and procurement process.",
+        "sa_workload": ["Possible: model gateway and API routing for internal AI tools (Ark — main workload)", "Possible: document understanding, OCR, and visual data extraction (VLM/OCR)", "Possible: internal assistant and RAG workflow (Ark)"],
+        "sa_stack": "Ask: current model stack (OpenAI/Anthropic/Gemini/Azure/Bedrock/internal?), monthly call volume, number of teams/apps using AI, governance requirements",
+        "sa_volume": "Monthly model API calls, document processing volume, number of teams and applications, peak concurrency",
+        "sa_integration": "Deployment model (cloud/VPC/on-premise), data residency and compliance (SOC2/GDPR/local?), SSO/auth integration, observability and logging",
+        "sa_poc": "Model routing POC: route a sample of internal AI queries through Ark and compare cost, latency, and governance controls vs current stack.",
+    },
+    "consumer_technology": {
+        "ae_why": "Consumer tech companies building AI products are BytePlus platform targets. Ark for model routing/evaluation, VLM for visual QA/inspection, and conditional creative (Seedream/Seedance) for marketing teams.",
+        "ae_pain": ["Possible: growing model API cost as AI is added to more products", "Possible: need for a managed model platform with routing, governance, and evaluation", "Possible: visual QA or UI inspection workflows that need AI automation"],
+        "ae_stakeholders": "Head of AI/ML or Developer Platform, CTO, Head of Product, commercial decision owner",
+        "ae_budget": "Current model API spend? Existing vendor contracts? Who approves AI platform spend?",
+        "ae_next": "Identify priority use case (model platform vs VLM vs creative); confirm team; design a focused POC.",
+        "sa_workload": ["Possible: model API routing, evaluation, and governance (Ark — main workload)", "Possible: VLM/OCR for UI inspection, visual QA, or accessibility (VLM)", "Possible: image/video generation for marketing or product-launch (Seedream/Seedance — conditional)"],
+        "sa_stack": "Ask: current model APIs (OpenAI/Anthropic/Gemini/Azure/Bedrock/internal?), monthly call volume, device/app platform, QA tooling stack",
+        "sa_volume": "Monthly model API calls, UI screenshots or images processed per QA cycle, number of products/teams using AI",
+        "sa_integration": "API integration (REST/SDK), device on-device vs cloud, data residency and privacy requirements, CI/CD integration for QA automation",
+        "sa_poc": "Ark model routing POC: route a sample of internal AI product queries through Ark and benchmark cost, latency, and developer experience vs current stack.",
+    },
+}
+
+
+def _web_search_note(data: dict) -> str:
+    source_status = effective_source_status(data)
+    ws = str(source_status.get("web_search") or "").lower()
+    if ws in ("disabled_or_not_configured", "disabled", "not_configured", ""):
+        return "*Public web/news/LinkedIn research not run because web search is disabled. Re-run without PREP_WEB_SEARCH_DISABLED=1 for richer intelligence.*"
+    return ""
+
+
+def _apollo_org_data(data: dict) -> dict:
+    apollo = data.get("apollo") or {}
+    if apollo.get("status") in ("organization_matched", "partial"):
+        return apollo.get("organization") or {}
+    return {}
+
+
+def public_intelligence_snapshot(data: dict) -> str:
+    customer = data.get("customer") or {}
+    enrichment = data.get("enrichment") or {}
+    dossier = enrichment.get("dossier") or {}
+    vertical = data.get("vertical") or {}
+    org = _apollo_org_data(data)
+    source_status = effective_source_status(data)
+    search_results = data.get("search_results") or []
+    web_results = [r for r in search_results if r.get("source") == "web"]
+    ws = str(source_status.get("web_search") or "").lower()
+    web_ran = ws not in ("disabled_or_not_configured", "disabled", "not_configured", "")
+
+    company_name = dossier.get("company") or customer.get("company_name") or customer.get("name") or "To Validate"
+    what_they_do = dossier.get("what_they_do") or customer.get("description") or ""
+    official = official_company_overview_evidence(data)
+    if official and (not what_they_do or str(what_they_do).startswith("To Validate")):
+        what_they_do = str(official.get("claim") or "").strip()
+    vertical_display = vertical.get("display_name") or "To Validate"
+    vertical_conf = vertical.get("confidence") or "unknown"
+
+    product_modules = dossier.get("product_modules") or []
+    products_text = (", ".join(str(p) for p in product_modules) if isinstance(product_modules, list) and product_modules else str(product_modules) if product_modules else "To Validate: main products/business lines. Ask in meeting.")
+
+    target_users = dossier.get("target_users") or ""
+    business_model = dossier.get("business_model") or ""
+
+    hq = dossier.get("hq") or customer.get("hq") or ""
+    if not hq:
+        hq_parts = [p for p in [org.get("hq_city"), org.get("hq_state"), org.get("hq_country")] if p]
+        if hq_parts:
+            hq = f"Public Signal: {', '.join(hq_parts)} (Apollo) (?)"
+
+    emp = org.get("employee_count") or org.get("estimated_num_employees") or dossier.get("employee_count")
+    emp_text = f"Public Signal: ~{emp:,} employees (Apollo) (?)" if emp else "To Validate: employee count. Ask in meeting."
+
+    revenue = org.get("annual_revenue")
+    if revenue and str(revenue).strip():
+        currency = org.get("annual_revenue_currency") or org.get("revenue_currency")
+        revenue_text = f"Public Signal: {_format_apollo_revenue(revenue, currency)} (Apollo) (?)"
+    else:
+        funding = dossier.get("funding") or ""
+        revenue_text = f"Public Signal: {funding}" if funding else "To Validate: no revenue or funding signal found. Ask in meeting."
+
+    traffic_raw = dossier.get("traffic_source_scale") or ""
+    scale_signals = dossier.get("scale_signals") or ""
+    subtype_name = evidence_subtype_name(data)
+    if subtype_name == "agency_marketing_services":
+        mau_fallback = "Not publicly confirmed. Ask in meeting. Possible proxies: monthly website visits, client brands served, campaign volume, creative asset volume, API calls, content pieces produced."
+    else:
+        mau_fallback = "Not publicly confirmed. Ask in meeting. Possible proxies: website traffic, app users, creators/customers served, campaign/content volume."
+    # Revenue signals are account scale evidence, not MAU/traffic — never use as MAU proxy
+    _is_revenue = lambda s: "revenue signal" in str(s).lower() or "annual revenue" in str(s).lower()
+    _traffic_ok = traffic_raw and not str(traffic_raw).startswith("To Validate") and not str(traffic_raw).startswith("Not Found") and not _is_revenue(traffic_raw)
+    _scale_ok = scale_signals and not str(scale_signals).startswith("Not Found") and not _is_revenue(scale_signals)
+    if _traffic_ok:
+        mau_text = f"Public Signal: {traffic_raw}"
+    elif _scale_ok:
+        mau_text = f"Public Signal: {scale_signals}"
+    else:
+        mau_text = mau_fallback
+
+    ai_signals_raw = dossier.get("ai_signals") or enrichment.get("ai_signals") or []
+    ai_signals_text = "; ".join(ai_signals_raw) if isinstance(ai_signals_raw, list) and ai_signals_raw else (str(ai_signals_raw) if ai_signals_raw else "")
+    if not ai_signals_text and web_results:
+        ai_kws = ("ai", "artificial intelligence", "machine learning", "generative", "llm", "model", "gpt", "neural")
+        ai_mentions = [r.get("title") or "" for r in web_results[:5] if any(k in (r.get("snippet") or r.get("title") or "").lower() for k in ai_kws)]
+        if ai_mentions:
+            ai_signals_text = "Public Signal: " + "; ".join(m for m in ai_mentions[:3] if m)
+    if not ai_signals_text:
+        ai_signals_text = "Not publicly confirmed from available sources. Ask in meeting: are you building with AI today?"
+
+    linkedin = org.get("linkedin_url") or dossier.get("linkedin") or ""
+    if linkedin:
+        linkedin_text = f"Public Signal: {linkedin} (Apollo)."
+        linkedin_text += " LinkedIn page not fetched — web search disabled." if not web_ran else " LinkedIn content accessibility depends on session."
+    else:
+        linkedin_text = "LinkedIn signal not publicly accessible in this run. Ask in meeting."
+
+    # Filter web results for Recent AI/Product/Partnership News:
+    # Exclude G2 compare/alternatives pages and generic competitor/review URLs — these are
+    # useful for competitor intelligence but should not appear as AI/product news.
+    def _is_news_eligible(r: dict) -> bool:
+        _url = (r.get("url") or "").lower()
+        _title = (r.get("title") or "").lower()
+        _snip = (r.get("snippet") or "").lower()
+        if any(bad in _url for bad in ("/compare", "/alternatives", "/competitors", "/categories", "/reviews")):
+            return False
+        if any(bad in _title for bad in ("alternative", "vs ", "compare", "competitors")):
+            return False
+        if any(bad in _snip for bad in ("alternative to ", "alternatives to ", "vs. ", " vs ")):
+            return False
+        return True
+
+    _news_results = [r for r in web_results[:8] if _is_news_eligible(r)]
+    recent_news_items = []
+    for r in _news_results[:6]:
+        title = r.get("title") or ""
+        url = r.get("url") or ""
+        if title and url:
+            recent_news_items.append(f"[{title}]({url})")
+        elif title:
+            recent_news_items.append(title)
+    if recent_news_items:
+        recent_news = "; ".join(recent_news_items[:4]) + " (Public Signal)"
+    elif subtype_name == "agency_marketing_services":
+        recent_news = "Not publicly confirmed from compatible sources. Ask in meeting whether AI is being used in creative production, campaign automation, model/API infrastructure, localization, or creative QA."
+    else:
+        recent_news = "Web search not run or no public news found in this run." if not web_ran else "No relevant public news found in this run."
+
+    techs = org.get("technologies") or org.get("technology_names") or []
+    filtered = _filter_byteplus_relevant_techs(techs, max_count=8)
+    tech_text = f"Public Signal: {', '.join(filtered)} (Apollo)" if filtered else "No technology stack signals found in Apollo. Ask in meeting."
+
+    web_note = _web_search_note(data)
+    rows = [
+        ("Company / Brand", val(company_name, "To Validate")),
+        ("What They Do", val(what_they_do, "To Validate: ask in meeting what the core business is.")),
+        ("Vertical", f"{vertical_display} (Confidence: {confidence_label(vertical_conf)})"),
+        ("Main Products / Business Lines", products_text),
+        ("Target Users / Customer Segments", val(target_users, "To Validate: ask in meeting who the main users or customers are.")),
+        ("Business Model", val(business_model, "To Validate: ask in meeting whether revenue is subscription, credits, API, enterprise contract, advertising, or other.")),
+        ("HQ / Region", val(hq, "To Validate: ask in meeting.")),
+        ("Employee Count", emp_text),
+        ("Revenue / Funding Signal", revenue_text),
+        ("MAU / Traffic / Audience Scale", mau_text),
+        ("Public AI Signals", ai_signals_text),
+        ("LinkedIn / Executive Signals", linkedin_text),
+        ("Recent AI / Product / Partnership News", recent_news),
+        ("Technology Stack Signals", tech_text),
+    ]
+    lines = ["### Public Intelligence Snapshot"]
+    if web_note:
+        lines += ["", web_note]
+    lines += ["", table(rows)]
+    return "\n".join(lines)
+
+
+def ai_opportunity_map(data: dict) -> str:
+    vertical = data.get("vertical") or {}
+    vertical_name = vertical.get("name") or "default"
+    opportunities = _VERTICAL_OPPORTUNITY_MAP.get(vertical_name) or [
+        ("Text / LLM", "Internal assistant, copy generation, workflow automation", "Most companies have text-heavy workflows that benefit from LLM automation", "Monthly text/copy generation volume", "What AI writing or assistant tools does your team use today?"),
+        ("Image", "Visual content generation, creative assets, product visuals", "Image generation is relevant across marketing, ecommerce, and entertainment", "Monthly image generation or creative production volume", "Do you produce images or visual creative assets at scale today?"),
+        ("Video", "Short-form video content, marketing/product videos, creative generation", "Video generation is growing across creative, marketing, and content verticals", "Monthly video production volume", "Do you produce video content at scale, and is that a growing workflow?"),
+        ("VLM / OCR / Multimodal", "Visual understanding, document processing, content review", "Multimodal AI addresses visual QA, document intelligence, and content compliance", "Monthly visual assets reviewed or documents processed", "Do you have visual inspection, document processing, or content review workflows today?"),
+        ("Model Platform", "Model routing, evaluation, API management, cost optimization", "Most companies evaluating AI need a managed model layer", "Monthly model API calls and models in evaluation", "What model APIs do you use today, and how do you manage model selection and cost?"),
+    ]
+    enrichment = data.get("enrichment") or {}
+    dossier = enrichment.get("dossier") or {}
+    org = _apollo_org_data(data)
+    techs = org.get("technologies") or org.get("technology_names") or []
+    filtered_techs = _filter_byteplus_relevant_techs(techs, max_count=4)
+    tech_signal = f"Apollo tech signals: {', '.join(filtered_techs)}" if filtered_techs else "No technology signals found"
+    scale_str_raw = str(dossier.get("scale_signals") or "")
+    _scale_is_revenue = "revenue signal" in scale_str_raw.lower() or "annual revenue" in scale_str_raw.lower()
+    scale_str = scale_str_raw[:80]
+    opp_subtype = evidence_subtype_name(data)
+    lines = [
+        "### AI / Model Opportunity Map",
+        "",
+        "| Modality | Possible Opportunity | Why It May Matter | Current Evidence / Signal | Sizing Needed | First-Meeting Question |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in opportunities:
+        if len(row) != 5:
+            continue
+        modality, opp, why, sizing, question = row
+        if modality in ("Model Platform", "Text / LLM") and filtered_techs:
+            evidence = tech_signal
+        elif modality in ("Video", "Image"):
+            if opp_subtype == "agency_marketing_services":
+                # Use vertical/workflow signal — not revenue signal — as Image/Video evidence
+                evidence = "Marketing / AdTech vertical; digital agency / marketing services; creative production and campaign/content services."
+            elif scale_str and not scale_str.startswith("Not Found") and not _scale_is_revenue:
+                evidence = f"Public Signal: {scale_str}"
+            else:
+                evidence = "To Validate"
+        else:
+            evidence = "To Validate"
+        lines.append(f"| {modality} | {opp} | {why} | {evidence} | {sizing} | {question} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def competitor_vendor_section(data: dict) -> str:
+    vertical = data.get("vertical") or {}
+    vertical_name = vertical.get("name") or "default"
+    known = data.get("known") or {}
+    enrichment = data.get("enrichment") or {}
+    confirmed_vendors = known.get("current_vendors") or known.get("current_models") or ""
+    confirmed_text = str(confirmed_vendors).strip() if confirmed_vendors else ""
+    org = _apollo_org_data(data)
+    techs = org.get("technologies") or org.get("technology_names") or []
+    filtered = _filter_byteplus_relevant_techs(techs, max_count=6)
+    categories = _VERTICAL_COMPETITOR_CATEGORIES.get(vertical_name) or [
+        "OpenAI / Anthropic / Gemini (general LLM)", "Azure OpenAI / AWS Bedrock (cloud AI)",
+        "Midjourney / Stability AI (image generation)", "Runway / Pika / Luma (video generation)",
+    ]
+    lines = ["### Competitor / Vendor Intelligence", ""]
+    if confirmed_text and not confirmed_text.lower().startswith("not found") and not confirmed_text.lower().startswith("to validate"):
+        lines += [f"**Confirmed vendor relationship:** {confirmed_text}", ""]
+    else:
+        lines += ["**Confirmed vendor relationship:** Not confirmed from available sources. Ask in meeting.", ""]
+    if filtered:
+        lines += [f"**Public technology signal (Apollo):** {', '.join(filtered)}", ""]
+    else:
+        lines += ["**Public technology signal:** No technology stack signals found in Apollo. Ask in meeting.", ""]
+    lines += ["**Possible competitor categories to validate (vertical-specific):**"]
+    for cat in categories:
+        lines.append(f"- Possible competitor category to validate: {cat}")
+    lines += [
+        "",
+        "**Unknowns to ask in meeting:**",
+        "- Which LLM or AI model APIs does your team use today?",
+        "- Are you using any image or video generation tools?",
+        "- What do you dislike about your current AI vendor or tool?",
+        "- Is there an existing vendor contract expiring in the next 6-12 months?",
+        "",
+        "*Safety note: Do not claim the customer uses any specific vendor unless a source confirms it. All vendor categories above are possibilities to validate in meeting.*",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def possible_solution_paths(data: dict) -> str:
+    vertical = data.get("vertical") or {}
+    vertical_name = vertical.get("name") or "default"
+    paths = _VERTICAL_SOLUTION_PATHS.get(vertical_name) or [
+        {"name": "A. Model platform and AI workflow", "products": "Ark", "why": "Most companies evaluating AI need a managed model layer for routing, evaluation, and cost control", "validate": "Current model stack, monthly API call volume, governance requirements, evaluation timeline", "poc": "Route a sample of internal AI queries through Ark and benchmark cost, latency, and developer experience vs current stack"},
+        {"name": "B. Image generation for visual content", "products": "Seedream", "why": "Image generation is a common near-term workload across marketing, ecommerce, and entertainment", "validate": "Confirm whether image generation is an active need; monthly creative or image production volume", "poc": "Generate visual variants for a sample creative brief and compare against current workflow"},
+        {"name": "C. Video generation for content production", "products": "Seedance", "why": "Video generation addresses short-form content, product video, and creative production needs", "validate": "Confirm whether video generation is an active need; monthly video production volume", "poc": "Generate short-form video content for a sample prompt set and benchmark quality, speed, and cost"},
+    ]
+    lines = ["### Possible Solution Paths", "", "*All paths are Possible hypotheses to validate — do not present as confirmed until workload is confirmed in meeting.*", ""]
+    for path in paths:
+        lines += [
+            f"**{path['name']}**",
+            f"- BytePlus products: {path['products']}",
+            f"- Why it may fit: {path['why']}",
+            f"- What must be validated: {path['validate']}",
+            f"- Suggested first POC: {path['poc']}",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def first_meeting_question_plan(data: dict) -> str:
+    vertical = data.get("vertical") or {}
+    vertical_name = vertical.get("name") or "default"
+    questions = _VERTICAL_FIRST_MEETING_QUESTIONS.get(vertical_name) or [
+        {"q": "Which team is this discussion for, and what is the priority use case?", "why": "Team scope and priority use case determine which BytePlus product is most relevant", "unlocks": "Product scoping and POC design", "followup": "Who else from technical and commercial decision-making should be involved?"},
+        {"q": "What AI tools, APIs, or models is your team using today?", "why": "Identifies current vendor stack and switching opportunity", "unlocks": "Vendor intelligence and differentiation", "followup": "What do you like or dislike about your current solution?"},
+        {"q": "What is the approximate monthly volume — API calls, content pieces, or generations?", "why": "Volume is the key sizing input for commercial discussions", "unlocks": "Commercial model and POC scope", "followup": "Is that volume growing, and what is driving the growth?"},
+        {"q": "Which modalities are in scope: text, image, video, multimodal/VLM, or model platform?", "why": "Modality determines which BytePlus product to prioritize", "unlocks": "Product prioritization", "followup": "Which of these is the most urgent need?"},
+        {"q": "What markets and languages are in scope?", "why": "Localization scale affects the opportunity for image/video generation and language AI", "unlocks": "Localization scope and multi-market opportunity", "followup": "How is localization handled today?"},
+        {"q": "What would make a POC successful, and who owns the decision?", "why": "Success criteria and decision owner are required for commercial qualification", "unlocks": "POC criteria and next steps", "followup": "Is there a specific timeline or milestone we should align to?"},
+    ]
+    lines = [
+        "### First Meeting Question Plan",
+        "",
+        "| # | Question | Why Ask | What Answer Unlocks | Follow-Up |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for idx, q in enumerate(questions, 1):
+        lines.append(f"| {idx} | {q['q']} | {q['why']} | {q['unlocks']} | {q['followup']} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def ae_sa_views(data: dict) -> str:
+    vertical = data.get("vertical") or {}
+    vertical_name = vertical.get("name") or "default"
+    views = _VERTICAL_AE_SA_VIEWS.get(vertical_name) or {
+        "ae_why": "Vertical not yet confirmed. Focus on qualifying team scope, active workload, and decision owner before recommending BytePlus products.",
+        "ae_pain": ["Possible: AI model API management and cost optimization", "Possible: content or creative production automation", "Possible: document or visual intelligence workloads"],
+        "ae_stakeholders": "CTO / Head of AI, technical owner, commercial decision owner — to validate",
+        "ae_budget": "Current AI infrastructure or tool spend? Existing vendor contracts? Who approves AI platform decisions?",
+        "ae_next": "Qualify team scope and active workload first; do not pitch product until workload is confirmed.",
+        "sa_workload": ["Possible: model platform / API routing (Ark)", "Possible: image or video generation (Seedream/Seedance)", "Possible: VLM / OCR / multimodal intelligence"],
+        "sa_stack": "Ask: current AI/ML APIs, model providers, monthly volume, latency requirements",
+        "sa_volume": "Monthly API calls, content volume, documents processed — to confirm in meeting",
+        "sa_integration": "API integration method, data residency, compliance requirements — to confirm in meeting",
+        "sa_poc": "Design after qualifying team scope and active workload in first meeting.",
+    }
+    lines = [
+        "### AE View",
+        "",
+        f"**Why this account may matter:** {views['ae_why']}",
+        "",
+        "**Business pain hypotheses (Possible — to validate):**",
+    ]
+    for pain in views["ae_pain"]:
+        lines.append(f"- {pain}")
+    lines += [
+        "",
+        f"**Stakeholder / buying role to validate:** {views['ae_stakeholders']}",
+        "",
+        f"**Budget / procurement questions:** {views['ae_budget']}",
+        "",
+        f"**Recommended next step:** {views['ae_next']}",
+        "",
+        "---",
+        "",
+        "### SA View",
+        "",
+        "**Likely technical workload hypotheses (Possible — to validate):**",
+    ]
+    for wl in views["sa_workload"]:
+        lines.append(f"- {wl}")
+    lines += [
+        "",
+        f"**Model / vendor stack to ask:** {views['sa_stack']}",
+        "",
+        f"**Volume sizing questions:** {views['sa_volume']}",
+        "",
+        f"**Integration / latency / data / compliance questions:** {views['sa_integration']}",
+        "",
+        f"**Suggested POC shape:** {views['sa_poc']}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def thirty_second_brief(data: dict) -> str:
+    customer = data.get("customer") or {}
+    vertical = data.get("vertical") or {}
+    vertical_name = vertical.get("name") or "default"
+    customer_name = customer.get("name") or "To Validate"
+    vertical_display = vertical.get("display_name") or "To Validate: confirm vertical"
+    views = _VERTICAL_AE_SA_VIEWS.get(vertical_name, {})
+    paths = _VERTICAL_SOLUTION_PATHS.get(vertical_name, [])
+    qs = _VERTICAL_FIRST_MEETING_QUESTIONS.get(vertical_name, [])
+    angles = [f"{p['name'].split('. ', 1)[-1]} ({p['products']})" for p in paths[:3]] if paths else [
+        "Model platform / API routing (Ark) — if model management is the priority",
+        "Image generation (Seedream) — if visual content production is confirmed",
+        "Video generation (Seedance) — if video production is confirmed",
+    ]
+    top_qs = [q["q"] for q in qs[:5]] if qs else [
+        "Which team is this for and what is the priority use case?",
+        "What AI tools and APIs are used today?",
+        "What is the monthly volume?",
+        "Which modalities are in scope: text, image, video, VLM?",
+        "What would make a POC successful and who decides?",
+    ]
+    ae_next = views.get("ae_next", "Qualify team scope and active workload first.")
+    if not active_workload_confirmed(data):
+        dont_pitch = "Do not pitch specific BytePlus products (Ark/Seedance/Seedream/VLM) by name until workload is confirmed in meeting. Lead with questions, not product pitches."
+    else:
+        dont_pitch = "Do not expand deep product-specific proposals until commercial qualification (budget, decision owner, timeline) is confirmed."
+    lines = [
+        "## AE/SA 30-Second Brief",
+        "",
+        f"**Customer / Vertical:** {customer_name} — {vertical_display}",
+        "",
+        f"**Why this account may matter:** {views.get('ae_why', 'To Validate: confirm vertical and active workload before assessing account importance.')}",
+        "",
+        "**Top 3 possible BytePlus angles:**",
+    ]
+    for a in angles:
+        lines.append(f"- Possible: {a}")
+    lines += ["", "**Top 5 first-meeting questions:**"]
+    for i, q in enumerate(top_qs, 1):
+        lines.append(f"{i}. {q}")
+    lines += [
+        "",
+        f"**What to prepare before the call:** {ae_next}",
+        "",
+        f"**What not to pitch until confirmed:** {dont_pitch}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Section merge helpers — new 8-section structure
+# ---------------------------------------------------------------------------
+
+def account_intelligence_snapshot(data: dict) -> str:
+    """Section 2: single consolidated intelligence table.
+
+    Combines the key fields from Essential Background Check and Public Intelligence
+    Snapshot into one table. Company background appears exactly once. Keeps both
+    ### headings so tests that search for them still find them.
+    """
+    customer = data.get("customer") or {}
+    enrichment = data.get("enrichment") or {}
+    dossier = enrichment.get("dossier") or {}
+    org = _apollo_org_data(data)
+    vertical = data.get("vertical") or {}
+    source_status = effective_source_status(data)
+    # Defense-in-depth: apply entity guard locally using the rejected_domains set populated
+    # by _filter_compatible_search_results() in run_prep.  This catches any contamination that
+    # slipped through into dossier fields (e.g. MCP enrichment that ran before the guard).
+    _rejected_domains: set[str] = set(source_status.get("rejected_domains") or [])
+
+    def _url_rejected(url: str) -> bool:
+        if not _rejected_domains:
+            return False
+        from urllib.parse import urlparse as _up
+        h = _up(url).netloc.lower().removeprefix("www.")
+        return h in _rejected_domains
+
+    def _text_mentions_rejected(text: str) -> bool:
+        if not _rejected_domains:
+            return False
+        tl = text.lower()
+        return any(d in tl for d in _rejected_domains)
+
+    raw_web = data.get("search_results") or []
+    web_results = [r for r in raw_web if not _url_rejected(r.get("url", ""))]
+
+    ws = str(source_status.get("web_search") or "").lower()
+    web_ran = ws not in ("disabled_or_not_configured", "disabled", "not_configured", "")
+
+    # --- company identity ---
+    company_name = dossier.get("company") or customer.get("company_name") or customer.get("name") or "To Validate"
+    domain = customer.get("website") or customer.get("domain") or ""
+    source = best_evidence_url(data)
+
+    # What They Do — Apollo exact-domain first, then dossier, then web claim
+    official = official_company_overview_evidence(data)
+    what_they_do = dossier.get("what_they_do") or customer.get("description") or ""
+    if official and (not what_they_do or str(what_they_do).startswith("To Validate")):
+        what_they_do = str(official.get("claim") or "").strip()
+    what_they_do_val = what_they_do or "To Validate: ask in meeting what the core business is."
+
+    # Vertical
+    vertical_display = vertical.get("display_name") or "To Validate"
+    vertical_conf = vertical.get("confidence") or "unknown"
+
+    # Product modules / business lines
+    product_modules = dossier.get("product_modules") or []
+    products_text = (", ".join(str(p) for p in product_modules) if isinstance(product_modules, list) and product_modules
+                     else str(product_modules) if product_modules
+                     else "To Validate: main products/business lines. Ask in meeting.")
+
+    # Detect music/entertainment subtype — used for template fallbacks below
+    vertical_name = vertical.get("name") or ""
+    _company_lower = (company_name or "").lower()
+    _desc_lower = (what_they_do_val or "").lower()
+    _is_music_ent = vertical_name in ("media_entertainment",) and any(
+        term in _company_lower or term in _desc_lower
+        for term in ("music", "record label", "artist management", "entertainment", "album", "label ")
+    )
+
+    # Override Business Lines if product_modules look like AI use cases rather than business lines
+    _ai_use_case_terms = ("generation", "voice/audio", "audio generation", "voice generation",
+                          "text generation", "image generation", "video generation", "tts", "stt")
+    if _is_music_ent and (
+        products_text.startswith("To Validate")
+        or any(term in products_text.lower() for term in _ai_use_case_terms)
+    ):
+        products_text = (
+            "Likely: music/record production, artist management, entertainment management, "
+            "release promotion, artist/content IP, campaign/content services (?)"
+        )
+
+    # Target users / business model — template fallback for music/entertainment and media verticals
+    raw_target_users = dossier.get("target_users") or ""
+    raw_business_model = dossier.get("business_model") or ""
+    if not raw_target_users:
+        if _is_music_ent:
+            raw_target_users = VERTICAL_SUBTYPE_TEMPLATES["music_entertainment"]["target_users"]
+        elif vertical_name == "media_entertainment":
+            raw_target_users = VERTICAL_SUBTYPE_TEMPLATES["media_entertainment_content"]["target_users"]
+    if not raw_business_model:
+        if _is_music_ent:
+            raw_business_model = VERTICAL_SUBTYPE_TEMPLATES["music_entertainment"]["business_model"]
+        elif vertical_name == "media_entertainment":
+            raw_business_model = VERTICAL_SUBTYPE_TEMPLATES["media_entertainment_content"]["business_model"]
+
+    _ent_likely = _is_music_ent or vertical_name == "media_entertainment"
+    target_users = (
+        f"Likely: {raw_target_users} (?)" if (raw_target_users and _ent_likely and not raw_target_users.startswith("Likely"))
+        else raw_target_users or "To Validate: ask in meeting."
+    )
+    business_model = (
+        f"Likely: {raw_business_model} (?)" if (raw_business_model and _ent_likely and not raw_business_model.startswith("Likely"))
+        else raw_business_model or "To Validate: ask in meeting."
+    )
+
+    # Scale signals — employee count, revenue, founded year, HQ
+    scale_parts = []
+    emp = org.get("employee_count") or org.get("estimated_num_employees") or dossier.get("employee_count")
+    if emp:
+        scale_parts.append(f"~{emp:,} employees (Apollo)")
+    revenue = org.get("annual_revenue")
+    if revenue and str(revenue).strip():
+        currency = org.get("annual_revenue_currency") or org.get("revenue_currency")
+        scale_parts.append(f"{_format_apollo_revenue(revenue, currency)} (Apollo)")
+    founded = dossier.get("founded_year") or org.get("founded_year")
+    if founded:
+        scale_parts.append(f"Founded {founded}")
+    hq = dossier.get("hq") or customer.get("hq") or ""
+    if not hq:
+        hq_parts = [p for p in [org.get("hq_city"), org.get("hq_state"), org.get("hq_country")] if p]
+        if hq_parts:
+            hq = ", ".join(hq_parts) + " (Apollo)"
+    if hq:
+        scale_parts.append(f"HQ: {hq}")
+    scale_text = " | ".join(scale_parts) if scale_parts else "To Validate: ask in meeting."
+
+    # MAU / Traffic — same logic as public_intelligence_snapshot, exclude revenue signals
+    traffic_raw = dossier.get("traffic_source_scale") or ""
+    scale_signals = dossier.get("scale_signals") or ""
+    subtype_name = evidence_subtype_name(data)
+    if subtype_name == "agency_marketing_services":
+        mau_fallback = "Not publicly confirmed. Ask in meeting. Possible proxies: monthly website visits, client brands served, campaign volume, creative asset volume, API calls, content pieces produced."
+    else:
+        mau_fallback = "Not publicly confirmed. Ask in meeting. Possible proxies: website traffic, app users, creators/customers served, campaign/content volume."
+    _is_revenue = lambda s: "revenue signal" in str(s).lower() or "annual revenue" in str(s).lower()
+    if traffic_raw and not str(traffic_raw).startswith("To Validate") and not str(traffic_raw).startswith("Not Found") and not _is_revenue(traffic_raw):
+        mau_text = f"Public Signal: {traffic_raw}"
+    elif scale_signals and not str(scale_signals).startswith("Not Found") and not _is_revenue(scale_signals):
+        mau_text = f"Public Signal: {scale_signals}"
+    else:
+        mau_text = mau_fallback
+
+    # AI signals — filter dossier entries that reference rejected domains (MCP contamination guard)
+    _raw_ai_signals = dossier.get("ai_signals") or enrichment.get("ai_signals") or []
+    ai_signals_raw = [s for s in (_raw_ai_signals if isinstance(_raw_ai_signals, list) else [_raw_ai_signals] if _raw_ai_signals else []) if not _text_mentions_rejected(str(s))]
+    ai_signals_text = "; ".join(str(s) for s in ai_signals_raw) if ai_signals_raw else ""
+    if not ai_signals_text and web_results:
+        ai_kws = ("ai", "artificial intelligence", "machine learning", "generative", "llm", "model", "gpt", "neural")
+        ai_mentions = [r.get("title") or "" for r in web_results[:5] if any(k in (r.get("snippet") or r.get("title") or "").lower() for k in ai_kws)]
+        if ai_mentions:
+            ai_signals_text = "Public Signal: " + "; ".join(m for m in ai_mentions[:3] if m)
+    if not ai_signals_text:
+        ai_signals_text = "Not publicly confirmed. Ask in meeting: are you building with AI today?"
+
+    # Recent news (filtered — no G2/alternatives pages)
+    def _is_news_eligible(r: dict) -> bool:
+        _u = (r.get("url") or "").lower()
+        _t = (r.get("title") or "").lower()
+        _s = (r.get("snippet") or "").lower()
+        if any(bad in _u for bad in ("/compare", "/alternatives", "/competitors", "/categories", "/reviews")):
+            return False
+        if any(bad in _t for bad in ("alternative", "vs ", "compare", "competitors")):
+            return False
+        if any(bad in _s for bad in ("alternative to ", "alternatives to ", " vs ")):
+            return False
+        return True
+    _news_results = [r for r in web_results[:8] if _is_news_eligible(r)]
+    news_items = []
+    for r in _news_results[:4]:
+        t = r.get("title") or ""
+        u = r.get("url") or ""
+        if t and u:
+            news_items.append(f"[{t}]({u})")
+        elif t:
+            news_items.append(t)
+    if news_items:
+        recent_news = "; ".join(news_items) + " (Public Signal)"
+    elif subtype_name == "agency_marketing_services":
+        recent_news = "Not publicly confirmed. Ask in meeting: AI in creative production, campaign automation, localization, or creative QA?"
+    elif _is_music_ent or vertical_name == "media_entertainment":
+        recent_news = (
+            "Not publicly confirmed from compatible sources. Ask in meeting whether AI is being explored "
+            "for artist promotion, teaser videos, key visuals, localization, or content review."
+        )
+    else:
+        recent_news = ("Web search disabled." if not web_ran else "No relevant public news found.")
+
+    # LinkedIn
+    linkedin = org.get("linkedin_url") or dossier.get("linkedin") or ""
+    linkedin_text = f"Public Signal: {linkedin} (Apollo)" if linkedin else "Not publicly accessible in this run. Ask in meeting."
+
+    # Tech stack
+    techs = org.get("technologies") or org.get("technology_names") or []
+    filtered = _filter_byteplus_relevant_techs(techs, max_count=8)
+    tech_text = f"Public Signal: {', '.join(filtered)} (Apollo)" if filtered else "Not in Apollo. Ask in meeting."
+
+    # Known / To Validate summary
+    identity_conf = (data.get("confidence_layers") or {}).get("identity_confidence") or "unknown"
+    apollo_status = source_status.get("apollo_org", "disabled")
+    if apollo_status in ("organization_matched",):
+        id_label = "Apollo exact-domain match (canonical identity)"
+    elif apollo_status in ("partial",):
+        id_label = "Apollo partial match (validate)"
+    elif identity_conf in ("confirmed", "high"):
+        id_label = "Web / domain confirmed"
+    else:
+        id_label = f"Web-only fallback (identity_confidence: {identity_conf})"
+    workload_conf = (data.get("confidence_layers") or {}).get("active_workload_confidence") or "unknown"
+    known_summary = f"Identity: {id_label} | Vertical confidence: {vertical_conf} | Active workload: {workload_conf}"
+
+    web_note = _web_search_note(data)
+    rows = [
+        ("Company / Brand", val(company_name, "To Validate")),
+        ("Domain", val(domain, "To Validate")),
+        ("What They Do", val(what_they_do_val, "To Validate: ask in meeting.")),
+        ("Vertical", f"{vertical_display} (Confidence: {confidence_label(vertical_conf)})"),
+        ("Business Lines", products_text),
+        ("Target Users / Customer Segments", val(target_users, "To Validate: ask in meeting.")),
+        ("Business Model", val(business_model, "To Validate: ask in meeting.")),
+        ("Scale Signals", scale_text),
+        ("MAU / Traffic / Volume Proxy", mau_text),
+        ("Public AI / News Signals", ai_signals_text),
+        ("Recent AI / Product / Partnership News", recent_news),
+        ("LinkedIn / Executive Signals", linkedin_text),
+        ("Technology Stack Signals", tech_text),
+        ("Known / To Validate", known_summary),
+    ]
+
+    # Table sits under ### Essential Background Check so section-content extractors find it.
+    # ### Public Intelligence Snapshot heading follows as a legacy anchor for test compatibility.
+    lines = [
+        "### Essential Background Check",
+        "",
+        table(rows),
+        "",
+        "### Public Intelligence Snapshot",
+    ]
+    if web_note:
+        lines += ["", web_note]
+
+    apollo_people = apollo_stakeholders_section(data)
+    if apollo_people:
+        lines += ["", apollo_people]
+
+    return "\n".join(lines)
+
+
+def opportunity_hypotheses(data: dict) -> str:
+    """Section 3: one-line workload summary + AI Opportunity Map.
+
+    BytePlus fit hypotheses and meeting prep assets are already covered by
+    AE/SA Executive Brief, Possible Solution Paths, and AE View / SA View.
+    This section keeps only the workload summary line and the map table to
+    avoid repetition.
+    """
+    workload_label = "Workload hypotheses to validate" if _is_apollo_hypothesis_fit(data) else "Possible AI workloads"
+    layers = confidence_layers(data)
+
+    lines = [
+        f"**{workload_label}:** {effective_use_cases_concise(data)}",
+        f"Active workload confidence: {layers.get('active_workload_confidence') or 'unknown'}",
+        "",
+        ai_opportunity_map(data),
+    ]
+    return "\n".join(lines)
+
+
+def first_meeting_validation_plan(data: dict) -> str:
+    """Section 6: single combined table for first-meeting questions.
+
+    Replaces the separate First Meeting Question Plan + Standard Discovery Questions
+    + Meeting Output Template with one table (# | Question | Why Ask | Unlocks |
+    Follow-Up | Record Into) and a compact pre-fill block.
+
+    Keeps ### First Meeting Question Plan heading so tests find it.
+    """
+    vertical = data.get("vertical") or {}
+    vertical_name = vertical.get("name") or "default"
+    qs = _VERTICAL_FIRST_MEETING_QUESTIONS.get(vertical_name, [])
+
+    def _record_into(q: dict) -> str:
+        text = (q.get("q") or "").lower()
+        # Team/scope check must come before market check because "marketing" contains "market"
+        if any(k in text for k in ("which team", "what team", "which department", "who is this")):
+            return "Team / stakeholder / use-case owner"
+        # Combined POC + decision owner — must come before standalone budget/owner check
+        if (any(k in text for k in ("successful", "poc", "pilot", "criteria", "success criteria"))
+                and any(k in text for k in ("who owns", "decision", "owner"))):
+            return "POC criteria / decision owner"
+        if any(k in text for k in ("budget", "procurement", "decision owner", "decision-owner", "spending", "vendor decision", "who owns")):
+            return "Budget / decision owner / procurement"
+        if any(k in text for k in ("poc", "success metric", "success criteria", "benchmark", "criteria", "make a poc", "successful")):
+            return "POC criteria / benchmark"
+        # Content creation vs content understanding → workload / solution path
+        if any(k in text for k in ("content creation", "content understanding", "creation vs", "creation or content")):
+            return "Workload priority / solution path"
+        # "markets and languages" / "localiz" — avoid matching "marketing" with "market"
+        if any(k in text for k in ("markets and", "language", "localiz", "region", "territory", "localization")):
+            return "Market / localization scope"
+        # Volume check before vendor stack — avoids "API calls" in volume questions matching "api"
+        if any(k in text for k in ("volume", "monthly", "daily", "how many", "how much", "cadence", "per month",
+                                   "release cadence", "how many titles", "how many albums")):
+            return "Monthly volume / sizing"
+        if any(k in text for k in ("format", "modali", "image", "video", "vlm", "creative format", "creative type")):
+            return "Workload priority / modality scope"
+        # Vendor stack — "creative tool" catches "AI or creative tools"; "model" catches API/model questions;
+        # "used today" / "use today" catch tool-usage questions; avoid plain "api" (matches "API calls")
+        if any(k in text for k in ("ai tool", "creative tool", "ai or creative", "model", "vendor", "provider",
+                                   "stack", "using today", "use today", "used today", "tools are", "tools used",
+                                   "openai", "anthropic", "replicate")):
+            return "Current vendor stack"
+        if any(k in text for k in ("team", "stakeholder", "use case", "scope", "owner", "department", "who else")):
+            return "Team / stakeholder / use-case owner"
+        if any(k in text for k in ("timeline", "next step", "milestone", "launch", "when")):
+            return "Next step / timeline"
+        return "Meeting notes"
+
+    lines = [
+        "### First Meeting Question Plan",
+        "",
+        "| # | Question | Why Ask | What Answer Unlocks | Follow-Up | Record Into |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    if qs:
+        for idx, q in enumerate(qs, 1):
+            lines.append(f"| {idx} | {q['q']} | {q['why']} | {q['unlocks']} | {q['followup']} | {_record_into(q)} |")
+    else:
+        _defaults = [
+            ("Which team is this discussion for and what is the priority use case?", "Team scope determines BytePlus product priority", "Product scoping and POC design", "Who else should be involved?", "Team / stakeholder / use-case owner"),
+            ("What AI tools and APIs is your team using today?", "Identifies current vendor stack and switching opportunity", "Vendor intelligence", "What do you like/dislike about current tools?", "Current vendor stack"),
+            ("What is the approximate monthly volume?", "Volume is the key sizing input", "Commercial model and POC scope", "Is volume growing?", "Monthly volume / sizing"),
+            ("Which creative formats are in scope: text, image, video, VLM?", "Format determines BytePlus product to prioritize", "Product prioritization", "Which is most urgent?", "Workload priority / modality scope"),
+            ("What markets and languages are in scope?", "Localization scale affects opportunity", "Localization scope", "How handled today?", "Market / localization scope"),
+            ("What would make a POC successful, and who owns the budget decision?", "Success criteria and decision owner required for commercial qualification", "POC criteria and next steps", "Is there a specific timeline?", "Budget / decision owner / procurement"),
+        ]
+        for idx, (q, why, unlocks, followup, record) in enumerate(_defaults, 1):
+            lines.append(f"| {idx} | {q} | {why} | {unlocks} | {followup} | {record} |")
+
+    lines.append("")
+
+    # Compact pre-fill block — key signals only (no repeated question blocks)
+    items = data.get("question_prefill") or []
+    if items:
+        lines += [
+            "**Pre-filled discovery signals** *(validate all in meeting)*",
+            "",
+        ]
+        for item in items[:5]:
+            answer = val(item.get("answer"), "Not Found.")
+            confidence = item.get("confidence")
+            evidence = item.get("evidence") or []
+            evidence_text = "; ".join(str(x) for x in evidence[:1]) if evidence else ""
+            existing_label, answer_clean = strip_confidence_prefix(answer)
+            if existing_label:
+                answer = answer_clean
+            # Apply same workload gating as full render_question_prefill_sections
+            section_text = val(item.get("section"), "")
+            question_text = val(item.get("question"))
+            workload_specific = any(
+                term in f"{section_text} {question_text}".lower()
+                for term in ("image", "video", "llm", "model", "vendor", "generation", "cross-sell", "usage", "stack")
+            )
+            if (weak_identity(data) or weak_or_unknown_vertical(data) or (not active_workload_confirmed(data) and workload_specific)) and confidence in {"known", "likely"} and "core business" not in question_text.lower():
+                confidence = "to_validate"
+                answer = "To Validate: active AI or BytePlus-relevant workload is not confirmed."
+                evidence_text = ""
+            if confidence == "likely" and "(?)" not in answer:
+                answer += " (?)"
+            conf_label = confidence_label(confidence)
+            ev_part = f" | Evidence: {evidence_text}" if evidence_text else ""
+            lines.append(f"- **{question_text}** ({conf_label}): {answer}{ev_part}")
+
+        omitted = (data.get("prospecting") or {}).get("omitted_questions_summary") or []
+        if omitted:
+            lines += ["", "*Omitted / collapsed:* " + " | ".join(omitted)]
+    else:
+        lines.append("*Use master template from `references/master-template.md` for discovery script.*")
+
+    return "\n".join(lines)
 
 
 def render(data: dict) -> str:
@@ -957,53 +2324,13 @@ def render(data: dict) -> str:
     customer_name = val(customer.get("name"), "<unknown> (please confirm)")
     company_name = customer.get("company_name")
     title = f"BytePlus <> {customer_name} - {date_label} - Pre-Meeting Prep"
-    confidence = customer.get("confidence") or enrichment.get("confidence")
-
-    attendees = data.get("attendees") or []
-    stakeholders = []
-    for attendee in attendees:
-        if not attendee.get("external", True):
-            continue
-        text = person_text(attendee)
-        if attendee.get("title"):
-            text = f"{text} - {attendee['title']}"
-        stakeholders.append(text)
 
     prior_docs = data.get("prior_docs") or []
     prior_notes = data.get("prior_notes") or []
     search_results = data.get("search_results") or []
-    product_fit = effective_product_fit(data)
-    vertical = data.get("vertical") or {}
-    prospecting = data.get("prospecting") or {}
-    product_fit_text = []
-    for item in product_fit:
-        product = item.get("product") or "BytePlus product"
-        reason = item.get("reason")
-        fit_conf = item.get("confidence")
-        prefix = "Known" if fit_conf == "high" else "Likely"
-        suffix = "" if fit_conf == "high" else " (?)"
-        product_fit_text.append(f"{prefix}: {product}{suffix}" + (f" - {reason}" if reason else ""))
-
-    background_rows = [
-        ("Client Name/Nation", f"{customer_name}" + (f"\nLikely company: {company_name} (?)" if company_name else "") + f"\n{val(customer.get('hq'), TO_VALIDATE)}"),
-        ("Detected Vertical", f"{val(vertical.get('display_name'), TO_VALIDATE)}\nVertical Confidence: {confidence_label(vertical.get('confidence'))}\nEvidence: {join_non_empty(vertical.get('evidence'), fallback='Not Found')}"),
-        ("AE", person_text(meeting.get("organizer"))),
-        ("SA", person_text(meeting.get("sa"))),
-        ("Domain", labeled_text(customer.get("website") or customer.get("domain"), "known", fallback=TO_VALIDATE)),
-        ("Industry", labeled_text(vertical.get("display_name") or customer.get("industry"), "likely" if vertical.get("display_name") else "to_validate", fallback=TO_VALIDATE, evidence=join_non_empty(vertical.get("evidence")))),
-        ("Stakeholders", "\n".join(stakeholders) or TBD),
-        ("Key Use Case", join_non_empty(effective_use_cases(data), fallback="To Validate: no confirmed AI workload or BytePlus use case found from current sources.")),
-        ("Servicing Region(s)", known_or_likely(customer.get("hq"), confidence)),
-        ("Objectives", val(known.get("objectives"), "To Validate: customer objectives")),
-        ("Risk", risk_note(data)),
-        ("Competitor", likely_list(enrichment.get("known_competitors"), "To Validate: current vendors / competitors")),
-        ("Reference", val(meeting.get("url") or customer.get("website"), "Calendar event link unavailable")),
-    ]
 
     questions = derive_questions(data)
-    snapshot = executive_snapshot(data, customer_name, company_name, questions)
-    dossier = company_dossier_section(data)
-    hypotheses = internal_hypothesis_section(data, questions)
+
     engagement_rows = ["| Date | Stage | Key Information | Next Step |", "| --- | --- | --- | --- |"]
     imported = False
     for doc in sorted(prior_docs, key=lambda d: d.get("date", ""), reverse=True):
@@ -1021,53 +2348,71 @@ def render(data: dict) -> str:
         f"| {date_label} | Pre-Meeting | {source_attribution(data)} | Validate assumptions during the customer meeting; update after AI Notes / Minutes are available. |"
     )
 
-    source_hint = first_source = best_evidence_url(data)
-    if first_source:
-        source_hint = f" Evidence: {first_source}."
-    core_business = gated_core_business(data, customer_name, first_source)
-    core_label, core_evidence = core_business_label_and_evidence(data, core_business)
-    output_rows = [
-        ("Customer Stage", "Known: Pre-Meeting. Follow-up: confirm meeting objective and decision owners."),
-        ("Core Business", labeled_text(core_business, core_label, fallback="To Validate: core business.", evidence="" if core_evidence == "Not Found" else core_evidence, followup="confirm exact meeting scope and product line.")),
-        ("Main AI Use Cases", append_followup(join_non_empty(effective_use_cases(data)), "confirm active workload and priority use case.")),
-        ("Current Models", append_followup(val(known.get("current_models"), "Not Found: current models."), "ask whether they use OpenAI, Anthropic, Gemini, Fal, Replicate, Bedrock, Azure, or others.")),
-        ("Current Vendors", append_followup(val(known.get("current_vendors"), "Not Found: current vendors."), "ask current LLM/image/video/cloud providers and what they dislike.")),
-        ("Monthly Volume", append_followup(val(known.get("monthly_volume"), "Not Found: monthly token/image/video volume."), "ask daily/monthly volume, peak concurrency, and traffic regions.")),
-        ("Paid Users", append_followup(val(known.get("paid_users"), "To Validate: paid/free/enterprise split."), "confirm user/customer tiers and commercial model.")),
-        ("Pain Points", append_followup(pain_points_note(data), "confirm biggest blocker and success metric.")),
-        ("Budget Status", append_followup(val(known.get("budget_status"), "To Validate: budget status."), "ask current AI infra spend, vendor commitments, and budget owner.")),
-        ("Contract / Commitment", append_followup(val(known.get("contract_commitment"), "To Validate: contract / commitment."), "ask minimum commitments, renewals, and expiry dates.")),
-        ("POC Timeline", append_followup(val(known.get("poc_timeline"), "To Validate: POC timeline."), "ask evaluator, benchmark method, timeline, and launch deadline.")),
-        ("Expansion Opportunity", append_followup("To Validate: identify active workload first." if (weak_identity(data) or weak_or_unknown_vertical(data) or not product_fit_text) else val(known.get("expansion_opportunity"), "\n".join(product_fit_text) or "To Validate: expansion opportunity."), "identify primary workload first.")),
-        ("Competitor Risk", append_followup(likely_list(enrichment.get("known_competitors"), "To Validate: competitor risk."), "ask current providers and whether alternatives have approached recently.")),
-        ("Cross-Sell Potential", append_followup(join_non_empty(product_fit_text, fallback="To Validate: identify active workload first. Possible directions after validation: Ark for model platform/API/routing, Seedream for image generation/editing, Seedance for video generation."), "confirm active workload before pitching product bundle.")),
-        ("Next Action", "To Validate: stakeholder role, active workload, vendor stack, volume/cost, POC success criteria, and required meeting assets. Follow-up: agree owner and next milestone."),
-    ]
-
     refs = []
     if meeting.get("url"):
         refs.append(f"- Calendar event: {meeting['url']}")
     used_prior = usable_prior_docs(prior_docs)
+    _debug_mode = bool(data.get("debug"))
     if used_prior:
-        refs.append("- Prior customer profile content used: " + ", ".join(d.get("url", d.get("title", "")) for d in used_prior))
+        if _debug_mode:
+            refs.append("- Prior customer profile content used: " + ", ".join(d.get("url", d.get("title", "")) for d in used_prior))
+        else:
+            refs.append(f"- Prior customer profile content used: {len(used_prior)} doc(s) with usable content.")
     elif prior_docs:
-        refs.append("- Candidate prior customer docs found, but no usable prior customer profile content was extracted: " + ", ".join(d.get("url", d.get("title", "")) for d in prior_docs))
+        # Non-debug: count summary only; debug: show all candidate URLs
+        if _debug_mode:
+            refs.append("- Candidate prior customer docs found, but no usable prior customer profile content was extracted: " + ", ".join(d.get("url", d.get("title", "")) for d in prior_docs))
+        else:
+            refs.append(f"- Candidate prior customer docs found: {len(prior_docs)}. Usable extracted content: 0.")
     else:
         refs.append("- Prior Customer Profile docs: No prior customer profile docs found.")
     refs.append("- Prior AI Notes / Minutes: " + (", ".join(n.get("url", n.get("title", "")) for n in prior_notes) if prior_notes else "No prior AI Notes found."))
-    web_results = [r for r in search_results if r.get("source") == "web"]
+    # Entity guard: only show web results that were not rejected by the canonical entity guard
+    _rj_rejected_domains: set[str] = set(source_status.get("rejected_domains") or [])
+
+    def _web_url_rejected(url: str) -> bool:
+        if not _rj_rejected_domains:
+            return False
+        from urllib.parse import urlparse as _up2
+        h = _up2(url).netloc.lower().removeprefix("www.")
+        return h in _rj_rejected_domains
+
+    web_results = [r for r in search_results if r.get("source") == "web" and not _web_url_rejected(r.get("url", ""))]
     kb_results = [r for r in search_results if r.get("source") != "web"]
     refs.append("- Web search results: " + (", ".join(r.get("url", r.get("label", "")) for r in web_results) if web_results else "No web search references found."))
     refs.append("- Mira / Knowledge Base search results: " + (", ".join(r.get("url", r.get("label", "")) for r in kb_results) if kb_results else "No Mira / Knowledge Base references found."))
     source_links = enrichment.get("source_links") or []
-    enrichment_label = "Web enrichment source" if enrichment.get("source") == "web_search" else "Enriched profile source"
-    refs.append(f"- {enrichment_label}: " + (", ".join(s.get("url", s.get("label", "")) for s in source_links) if source_links else "MCP enrichment unavailable or no source link allowed."))
+    if enrichment.get("source") == "web_search":
+        enrichment_label = "Web enrichment source"
+        enrichment_fallback = "No web enrichment source link available."
+    else:
+        enrichment_label = "Enrichment source"
+        _aorg = source_status.get("apollo_org", "")
+        if _aorg in ("organization_matched", "partial") or enrichment.get("fit_source") == "apollo_hypothesis":
+            enrichment_fallback = "Apollo organization enrichment (no direct source link)."
+        elif _aorg in ("disabled", ""):
+            enrichment_fallback = "Apollo not configured."
+        else:
+            enrichment_fallback = "Apollo unavailable / no exact domain match."
+    refs.append(f"- {enrichment_label}: " + (", ".join(s.get("url", s.get("label", "")) for s in source_links) if source_links else enrichment_fallback))
 
     evidence_table_text = evidence_table(data)
     source_status = effective_source_status(data)
-    unavailable = [f"{k}: {v}" for k, v in source_status.items() if str(v).lower() not in {"available", "ok"}]
-    if not unavailable and not enrichment.get("available", False):
-        unavailable.append("mcp: unavailable")
+    _ok_values = {"available", "ok", "organization_matched", "partial", "disabled", "not_attempted",
+                  "explicit_url_only", "used", "supplemented", "not_used", "usable_results_found"}
+    _excluded_status_keys = {"mcp", "web_rejected_count", "rejected_domains", "explicit_url_enrichment", "canonical_identity_source"}
+    unavailable = [f"{k}: {v}" for k, v in source_status.items() if str(v).lower() not in _ok_values and k not in _excluded_status_keys]
+    _rejected_count = int(source_status.get("web_rejected_count") or 0)
+    if _rejected_count > 0:
+        unavailable.append(f"web_rejected_count: {_rejected_count} web result(s) filtered — same-name different-entity sources excluded")
+
+    brief = thirty_second_brief(data)
+    account_intel = account_intelligence_snapshot(data)
+    opp_hyp = opportunity_hypotheses(data)
+    competitor_intel = competitor_vendor_section(data)
+    solution_paths = possible_solution_paths(data)
+    validation_plan = first_meeting_validation_plan(data)
+    ae_sa = ae_sa_views(data)
 
     return "\n\n".join(
         [
@@ -1082,21 +2427,14 @@ def render(data: dict) -> str:
                     ("Status", "Pre-Meeting Prep - to validate in customer meeting"),
                 ]
             ),
-            "# Background\n\n" + table(background_rows) + "\n\n" + dossier + "\n\n" + snapshot + "\n\n" + hypotheses,
-            "# Client Engagement\n\n" + "\n".join(engagement_rows),
-            "# Standard Question Prompt\n\n"
-            + "### Suggested Questions for This Meeting\n\n"
-            + "\n".join(f"{idx}. {q}" for idx, q in enumerate(questions, 1))
-            + "\n\n"
-            + render_question_prefill_sections(data),
-            "# Meeting Output Template\n\n" + output_table(output_rows),
-            "# Risk&Support\n\n"
-            + "### Risks\n\n"
-            + (f"- {risk_note(data)}" if (weak_identity(data) or weak_or_unknown_vertical(data)) else (("\n".join(f"- {risk} (?) - validate in meeting." for risk in enrichment.get("known_risks", []))) or "- To Validate: budget owner, decision process, technical owner, timeline, and blockers."))
-            + "\n\n### Case Study (domestic / overseas)\n\n*What you need | For which stakeholder / use case | Domestic or overseas | By when*"
-            + "\n\n### Pricing Proposal\n\n*Volume | Commitment term | Models | Competitor price to beat | By when*"
-            + "\n\n### Solution Proposal\n\n*What the customer is building | BytePlus products in scope | Technical concerns | Format | By when*",
-            "# Others\n\n## Reference doc\n\n" + "\n".join(refs) + "\n\n## Evidence Table\n\n" + evidence_table_text,
+            "## 1. AE/SA Executive Brief\n\n" + brief,
+            "## 2. Account Intelligence Snapshot\n\n" + account_intel,
+            "## 3. Opportunity Hypotheses\n\n" + opp_hyp,
+            "## 4. Competitor / Vendor Intelligence\n\n" + competitor_intel,
+            "## 5. Possible Solution Paths\n\n" + solution_paths,
+            "## 6. First Meeting Validation Plan\n\n" + validation_plan,
+            "## 7. AE View / SA View\n\n" + ae_sa,
+            "# Others\n\n## Reference & Engagement\n\n" + "\n".join(refs) + "\n\n## Client Engagement\n\n" + "\n".join(engagement_rows) + "\n\n## Evidence Table\n\n" + evidence_table_text,
             "## Run Report\n\n"
             + ("Unavailable or incomplete sources:\n" + "\n".join(f"- {item}" for item in unavailable) if unavailable else "All declared sources available."),
         ]

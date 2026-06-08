@@ -85,6 +85,10 @@ Supported flags:
 --no-notify
 --prospecting-prompt <path>
 --industry <name>
+--no-apollo
+--apollo-refresh
+--apollo-max-people <n>
+--apollo-debug
 --debug
 ```
 
@@ -116,7 +120,15 @@ PREP_DOC_FOLDER_TOKEN=<folder_token>
 PREP_NOTIFY_USER_ID=<open_id>
 MCP_CUSTOMER_ENRICHMENT_URL=https://...
 MCP_CUSTOMER_ENRICHMENT_TOKEN=<token>
+APOLLO_API_KEY=<your_apollo_api_key>
+APOLLO_MAX_PEOPLE=5
+APOLLO_CACHE_TTL_HOURS=24
+APOLLO_WATERFALL_ENABLED=0
+APOLLO_REVEAL_EMAILS=0
+APOLLO_REVEAL_PHONE_NUMBERS=0
 ```
+
+Apollo enrichment (optional): set `APOLLO_API_KEY` to enable company firmographic and stakeholder candidate data for small, niche, or ambiguous companies. Apollo results are labeled `Likely (Apollo signal)` and never promoted to `Known`. Disable per-run with `--no-apollo`. See `references/apollo-enrichment.md` for the full contract.
 
 Required or useful Lark scopes depend on selected features:
 

@@ -16,6 +16,8 @@ REQUIRED_FILES = [
     "README.md",
     "scripts/run_prep.py",
     "scripts/render_prep_doc.py",
+    "scripts/enrichment/__init__.py",
+    "scripts/enrichment/apollo_enrichment.py",
 ]
 INCLUDE_DIRS = ["references", "config", "tests"]
 EXCLUDE_PATTERNS = [
