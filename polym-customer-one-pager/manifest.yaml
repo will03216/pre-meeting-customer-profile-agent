@@ -1,0 +1,61 @@
+name: polym-customer-one-pager
+version: 0.8.0
+stage: beta
+owners:
+  - SA Team
+
+description_for_install: |
+  客户「一客一策」完整账户计划合成。把会前的 prospection 画像与会后的
+  meeting notes 纪要合二为一，套用火山引擎「一客一策」标准模板，产出
+  一份持续维护的内部账户计划（输出永远英文，品牌/产品名保留原文）。
+  输入（SA 直接发链接，无需下载上传）：
+    • prospection 文档链接（polym-customer-prospect 产出的会前画像）
+    • meeting notes 链接（Lark 文档 / 飞书妙记 / VC 会议纪要 / 粘贴文本）
+    • 可选：已有的一客一策文档链接 → 进 Update mode（增量更新，不新建）
+    • 可选：SA 人工补充的内部数字（计收目标、钱包份额、预算、owner）
+  两种模式：Create（首次建档，从头合成新文档）/ Update（已有文档 + 新会议
+  → 以现有文档为基线增量合并、overwrite 打回原文档，保留已填数字与历史）。
+  流程：fetch 源文档 → 按字段映射抽取 → 缺口分析 → 套模板合成
+  →写 Lark 文档 →（可选，仅 SA 要求时）归档到 SA Wiki write_queue。
+  原则：内部敏感数字无明确来源一律标 [TBD]，绝不臆造；冲突以纪要为准；
+  白板/架构图降级为表格并提示手动补图。
+
+depends_on:
+  skills:
+    - polym-customer-prospect
+    - polym-sa-wiki
+  binaries:
+    - lark-cli: ">=1.0.20"
+  env:
+    - ONEPAGER_FOLDER_TOKEN: "一客一策文档的 Lark 文件夹 token（可选）"
+  optional_skills:
+    - lark-minutes: "会议纪要为飞书妙记时读取转写"
+    - lark-vc: "会议纪要为 VC 会议纪要时读取总结/待办/逐字稿"
+    - lark-sheets: "读取纪要中嵌入式表格的单元格数据"
+
+io_contract:
+  reads:
+    - lark_doc: prospection 画像文档、meeting notes 纪要文档、（Update mode）已有一客一策文档当基线
+    - lark_minutes: 妙记转写（可选）
+    - lark_vc: VC 会议纪要（可选）
+    - polym-sa-wiki: 客户已有知识与历史（脱敏规则）
+  writes:
+    - lark_doc: 独立的「一客一策」Lark 文档（始终）
+    - polym-sa-wiki: write_queue 提案归档（可选，仅 SA 要求时；customers/<name>/decisions/...）
+
+triggers:
+  - "一客一策"
+  - "one pager"
+  - "客户账户计划"
+  - "会后整理账户档案"
+  - "合成 prospection 和会议纪要"
+  - "结合会前画像和会后纪要"
+  - "做一个客户的 one pager"
+  - "更新一客一策"
+  - "客户档案合成"
+  - "更新这篇 one pager"
+  - "加一次会议到 one pager"
+  - "会后更新一下账户计划"
+  - "update the one pager with new meeting"
+
+deprecates: []
