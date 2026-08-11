@@ -1,6 +1,6 @@
 ---
 name: polym-customer-one-pager
-version: 0.5.0
+version: 0.8.0
 description: "客户「一客一策」完整账户计划合成。输入：prospection 文档链接（会前画像）+ meeting notes 文档链接（会后纪要），可选 SA 人工补充的内部数字。拉取两份源文档，按字段映射抽取信息，套用「一客一策」标准模板（骨架学习火山引擎模板，风格学习 Havas/爱诗科技/广实案例）合成账户计划。**风格是提炼式追踪文档，不是 prospection**：信息压成 bold bullet + callout，仅 4 张可追踪表保留为表格，重心在合作现状叙事 + 我方策略/行动/进展。**输出永远是英文（无论源文档/示例是什么语言）**，写入 Lark 文档；可选归档到 SA Wiki。内部敏感数字（计收目标/钱包份额/预算）无来源一律标 [TBD]，绝不臆造。"
 metadata:
   requires:
@@ -10,7 +10,8 @@ metadata:
 # polym-customer-one-pager — 一客一策账户计划合成 Skill
 
 > **衔接：** `polym-customer-prospect`（产出 prospection 画像，是本 skill 的输入之一）
-> **依赖：** `polym-sa-wiki`（wiki 归档）· `lark-cli`（Lark 文档读写）
+> **依赖：** `lark-cli`（Lark 文档读写）—— 唯一硬依赖
+> **可选：** `polym-sa-wiki`（仅当 SA 要求归档到 wiki 时才需要；不装不影响主流程）
 > **可选联动：** `lark-minutes`（妙记）· `lark-vc`（VC 会议纪要）· `lark-sheets`（读嵌入式表格）
 > **可选 env：** `ONEPAGER_FOLDER_TOKEN`（一客一策文档的 Lark 文件夹）
 
@@ -21,8 +22,12 @@ metadata:
 **Step 1 — 检查是否已登录（read-only）：**
 
 ```bash
-lark-cli auth status --json
+lark-cli auth status
 ```
+
+> ⚠️ 不带 flag 即可——本命令默认就输出 JSON。**不要加 `--as`**（`--as` 只在资源类命令上生效，
+> 如 `docs +fetch --as user`，在 `auth` 子命令上一律报错）。`--json` 在 lark-cli ≥1.0.85 被接受，
+> 但在旧版本会报 `unknown flag`，所以统一不加最稳。
 - `identities.user.status` 为 `ready` 或 `needs_refresh`（会在下次调用自动刷新）→ **已认证，跳过 Step 2-4，直接进 Phase 0**。
 - 报错 / `user.available=false` / `not logged in` → 走 Step 2 引导登录。
 - 若 `lark-cli` 命令本身不存在（`command not found` / `127`）→ 这是**安装**缺失，认证流程救不了，先走下面的 **Step 0 安装**，装好再回 Step 1。
@@ -46,7 +51,7 @@ lark-cli auth login --no-wait --json --recommend
 **Step 3 — 生成二维码并把 URL + 二维码发给用户，然后结束本轮：**
 
 ```bash
-lark-cli auth qrcode --output ./lark_auth_qr.png   # PNG（默认推荐）；用户明确要 ASCII 才加 --ascii
+lark-cli auth qrcode "<Step 2 拿到的 verification_url>" --output ./lark_auth_qr.png   # URL 是必填位置参数；用户明确要 ASCII 才加 --ascii
 ```
 把 `verification_url` **原样**（不要 URL-encode、不加空格）先输出，二维码图片放 URL 下面，并提示用户：「在浏览器/飞书完成授权后回来告诉我」。`verification_url` 与 `device_code` 是一次性的，**不要缓存**；每次需要认证都重新跑 Step 2。
 
@@ -87,7 +92,7 @@ lark-cli auth login --device-code "<Step 2 拿到的 device_code>"
 
 **🔀 两种运行模式（Phase 0 自动判定）：**
 - **Create mode（首次建档）**：没有 `existing_onepager` → 从 prospection + 纪要从头合成，`docs +create` 新建文档。
-- **Update mode（已有文档 + 新会议）**：给了 `existing_onepager` → **以现有文档为基线**，只把**新增纪要**增量合并进去，`docs +update --mode overwrite` **打回原文档**（doc_id/URL 不变）。**绝不从头重跑、绝不新建**——否则会丢掉已填的内部数字与历史 Engagement Log。详见 §8.5。
+- **Update mode（已有文档 + 新会议）**：给了 `existing_onepager` → **以现有文档为基线**，只把**新增纪要**增量合并进去，`docs +update --api-version v2 --command overwrite` **打回原文档**（doc_id/URL 不变）。**绝不从头重跑、绝不新建**——否则会丢掉已填的内部数字与历史 Engagement Log。详见 §8.5。
 - 触发语判定：用户给了「现有 one-pager 链接 + 新纪要」，或说「更新 / update / 加一次会议 / 会后更新一下」→ Update mode。不确定就问一句「是更新这篇现有的，还是新建？」
 
 **缺失输入协议：**
@@ -214,27 +219,38 @@ cat > ./onepager_content.md << 'EOF'
 <填好的模板内容>
 EOF
 
+# ⚠️ 所有 docs 命令必须带 --api-version v2。v1 接口已下线，v1-only flag 会被直接拒绝：
+#   --markdown     → 改用 --content 配 --doc-format markdown
+#   --folder-token → 改用 --parent-token
+#   --mode         → 改用 --command
+
 # Step 2A: Create mode — 新建文档
 lark-cli docs +create \
+  --api-version v2 \
   --title "$DOC_TITLE" \
-  ${ONEPAGER_FOLDER:+--folder-token "$ONEPAGER_FOLDER"} \
-  --markdown "@onepager_content.md" \
+  ${ONEPAGER_FOLDER:+--parent-token "$ONEPAGER_FOLDER"} \
+  --content "@onepager_content.md" \
+  --doc-format markdown \
   --as user
 # → 返回 doc_id (doc_token) 和 doc_url
 
 # Step 2B: Update mode — 不新建，直接 overwrite 打回原文档（doc_id 取自 Phase 0 fetch 的 existing_onepager）
 lark-cli docs +update \
+  --api-version v2 \
   --doc "<existing_onepager_doc_id>" \
-  --mode overwrite \
-  --markdown "@onepager_content.md" \
+  --command overwrite \
+  --content "@onepager_content.md" \
+  --doc-format markdown \
   --as user
 # → URL 不变，原文档被整篇合成结果覆盖（增量已在 Phase 3 合并进 onepager_content.md）
 
 # Step 3: 内容过大导致 +create 不全时，用 overwrite 补写（Create mode 用）
 lark-cli docs +update \
+  --api-version v2 \
   --doc "<doc_id_from_create>" \
-  --mode overwrite \
-  --markdown "@onepager_content.md" \
+  --command overwrite \
+  --content "@onepager_content.md" \
+  --doc-format markdown \
   --as user
 
 rm ./onepager_content.md
@@ -242,7 +258,7 @@ rm ./onepager_content.md
 
 > **⚠️ Update mode 的 overwrite 不是「拿新内容覆盖旧文档」那么简单**：`onepager_content.md` 必须是「**基线 + 本次增量合并后的完整文档**」（见 §8.5），不是只写新会议那一段。overwrite 会整篇替换，所以**少写的部分 = 丢失**——务必把现有文档的全部既有内容（含已填内部数字、历史 Engagement Log 行）一起带进 `onepager_content.md` 再 overwrite。
 
-> **⚠️ 验证回写时别被「假失败」骗到**：`lark-cli docs +create` 用 `--markdown` 创建时，**文字颜色（`<text color="blue">`）和 callout 背景色（`background-color="light-blue"`）是作为 block 的 style 属性存的，不会在 `+fetch` 的 HTML/markdown 回写里以标签形式回显**。所以 fetch 回来看到的是裸 `[TBD]`、callout 没有 `background-color` —— 这是**序列化表象，不代表颜色没生效**，在 Lark UI 里仍渲染为蓝色/浅蓝底。验证时**只核对结构**（章节齐全、4 张表是表格没塌成段落、callout/emoji 在、`[TBD]` 数量对），颜色以「我写入的源文件里有正确标签」为准，不要因为 fetch 不回显就反复重写或误报失败。
+> **⚠️ 验证回写时别被「假失败」骗到**：`lark-cli docs +create` 用 `--content ... --doc-format markdown` 创建时，**文字颜色（`<text color="blue">`）和 callout 背景色（`background-color="light-blue"`）是作为 block 的 style 属性存的，不会在 `+fetch` 的 HTML/markdown 回写里以标签形式回显**。所以 fetch 回来看到的是裸 `[TBD]`、callout 没有 `background-color` —— 这是**序列化表象，不代表颜色没生效**，在 Lark UI 里仍渲染为蓝色/浅蓝底。验证时**只核对结构**（章节齐全、4 张表是表格没塌成段落、callout/emoji 在、`[TBD]` 数量对），颜色以「我写入的源文件里有正确标签」为准，不要因为 fetch 不回显就反复重写或误报失败。
 
 文档创建后立即回复（默认到此即结束，不自动归档 wiki）：
 

@@ -25,7 +25,7 @@ depends_on:
     - polym-customer-prospect
     - polym-sa-wiki
   binaries:
-    - lark-cli: ">=1.0.20"
+    - lark-cli: ">=1.0.85"   # v2 docs API required; v1 interface is shut down
   env:
     - ONEPAGER_FOLDER_TOKEN: "一客一策文档的 Lark 文件夹 token（可选）"
   optional_skills:
