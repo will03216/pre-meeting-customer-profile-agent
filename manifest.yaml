@@ -11,27 +11,23 @@ description_for_install: |
     • Apollo.io organization + people enrichment
     • Company website + domain web scraping
     • Web search: AI news, LinkedIn, funding, MAU, competitor signals
-    • SA Wiki: existing knowledge and prior engagement history
   Synthesizes a comprehensive Lark prospection document covering
   company overview, AI/ML stack (including third-party resellers),
   vertical analysis, competitive landscape, BytePlus opportunity
-  assessment (text / image / video models), and tailored AE + SA
-  meeting questions. Then archives a summary to the SA Wiki.
+  assessment (text / image / video / audio models), and tailored AE + SA
+  meeting questions.
 
 depends_on:
-  skills:
-    - polym-sa-wiki
   binaries:
-    - lark-cli: ">=1.0.20"
+    - lark-cli: ">=1.0.85"   # v2 docs API required; v1 interface is shut down
   env:
-    - APOLLO_API_KEY: "Apollo.io API key (optional — skip enrichment if absent)"
+    - APOLLO_API_KEY: "Apollo.io API key (recommended — Agent A is skipped if unset/invalid; the run still completes)"
     - PROSPECTS_FOLDER_TOKEN: "Lark folder token for prospection docs (optional)"
 
 io_contract:
   reads:
     - web: company website, LinkedIn public pages, news, Crunchbase
     - apollo: organization enrichment, people/contacts search
-    - polym-sa-wiki: existing customer knowledge and engagement history
   writes:
     - lark_doc: standalone prospection Lark document (always)
 

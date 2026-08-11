@@ -170,6 +170,21 @@ Extract from public LinkedIn page:
 
 ## §5 — BytePlus Opportunity Scoring Rubric
 
+### Current Model Roster — Single Source of Truth
+
+**Every model recommendation in the prospection doc must name a model from this table.**
+When the roster changes, edit this table only — nothing else in the skill hardcodes a model name.
+
+| Modality | Model to recommend | Notes |
+|---|---|---|
+| Video generation | **Seedance 2.5** | Current flagship. Do not lead with Seedance 2.0 or earlier. |
+| Image generation | **Seedream 5.0 Pro** | Current flagship. Do not lead with Seedream 4.5 / 5.0 Lite. |
+| Speech / audio | **Seed Audio 1.0** | Use for all TTS, voice, dubbing and voice-cloning discussion. Supersedes the Seed TTS line — do not recommend Seed TTS. |
+| Text / LLM | **Doubao** (current generation) | Confirm the exact tier with the AE before the meeting. |
+
+Superseded models may still be *named* when describing what a customer already uses, or
+when a customer asks about them directly. The rule is about what we **lead with**.
+
 ### How to Score (High / Medium / Low for each model type)
 
 **Score High if 2+ of these are true:**
@@ -193,20 +208,20 @@ Extract from public LinkedIn page:
 
 ### Vertical Opportunity Map
 
-| Vertical | Text/LLM | Image | Video | Key BytePlus Use Cases |
-|---|---|---|---|---|
-| E-commerce / Retail | H | H | H | Product description gen, background removal, product video ads |
-| Media & Entertainment | M | M | H | Video generation, dubbing, content creation |
-| Gaming | L | H | H | Asset generation, NPC dialogue, cutscene gen |
-| Marketing / AdTech | H | H | H | Copy gen, creative gen, video ads |
-| SaaS / Dev Tools | H | L | L | Code assist, docs gen, customer support |
-| Fintech / Banking | H | L | L | Report gen, compliance docs, customer comms |
-| Healthcare | H | M | L | Medical summarization, patient comms, imaging (image) |
-| EdTech | H | M | H | Course content, tutoring, explainer videos |
-| Customer Service | H | L | L | Chatbot, agent assist, ticket classification |
-| Social / Creator | M | H | H | Content creation tools, filters, video effects |
-| Logistics / Supply Chain | M | L | L | Route optimization reports, comms |
-| HR / Recruiting | H | L | L | JD gen, screening, onboarding docs |
+| Vertical | Text/LLM | Image | Video | Audio | Key BytePlus Use Cases |
+|---|---|---|---|---|---|
+| E-commerce / Retail | H | H | H | M | Product description gen, background removal, product video ads, voice-over for ad creative |
+| Media & Entertainment | M | M | H | H | Video generation, dubbing, localisation voice-over, content creation |
+| Gaming | L | H | H | H | Asset generation, NPC voice + dialogue, cutscene gen |
+| Marketing / AdTech | H | H | H | H | Copy gen, creative gen, video ads, multilingual voice-over |
+| SaaS / Dev Tools | H | L | L | L | Code assist, docs gen, customer support |
+| Fintech / Banking | H | L | L | M | Report gen, compliance docs, customer comms, IVR / voice agent |
+| Healthcare | H | M | L | M | Medical summarization, patient comms, imaging (image), patient voice reminders |
+| EdTech | H | M | H | H | Course content, tutoring, explainer videos, narration + pronunciation |
+| Customer Service | H | L | L | H | Chatbot, agent assist, ticket classification, voice bot / IVR |
+| Social / Creator | M | H | H | H | Content creation tools, filters, video effects, creator voice tools |
+| Logistics / Supply Chain | M | L | L | L | Route optimization reports, comms |
+| HR / Recruiting | H | L | L | L | JD gen, screening, onboarding docs |
 
 ### Volume Estimation Guide
 
@@ -222,6 +237,8 @@ Use headcount + vertical as proxy for monthly volume:
 
 Image: 1 employee ≈ 0.1–1k images/month for internal tools; multiply 10x for consumer product
 Video: consumer video platforms typically 10k–1M+ video minutes/month
+Audio: voice bot / IVR ≈ 1–10k voice minutes per 100 daily support conversations;
+       content localisation ≈ 1 audio hour per finished video hour per target language
 
 ---
 

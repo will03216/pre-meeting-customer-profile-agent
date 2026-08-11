@@ -30,7 +30,7 @@ If a field has no data, write `[Not found]` — never leave blanks or hallucinat
 
 - **What they do:** <one sentence>
 - **AI situation:** <current AI tool usage and maturity — one sentence>
-- **BytePlus fit:** Text [H/M/L] · Image [H/M/L] · Video [H/M/L] — <why in 8 words>
+- **BytePlus fit:** Text [H/M/L] · Image [H/M/L] · Video [H/M/L] · Audio [H/M/L] — <why in 8 words>
 - **Competitive risk:** <main competitor already in play, or "None identified">
 - **Key question to answer:** <the single most important unknown going into the meeting>
 
@@ -84,10 +84,16 @@ Include dates. Source in parentheses.>
 
 ### Model Coverage Summary
 
+> **BytePlus Alternative** must name a model from the Current Model Roster
+> (`references/web-enrichment-workflow.md` §5): Seedance 2.5 · Seedream 5.0 Pro ·
+> Seed Audio 1.0 · Doubao. Never fill this column with a superseded model.
+
 | AI Capability | Confirmed Model | Confidence | BytePlus Alternative |
 |---|---|---|---|
-| <capability, e.g. Text generation> | <model> | ✅ Confirmed / Medium / Low | <BytePlus product or "N/A"> |
-| <Video generation> | **Unknown** | ❓ | **Seedance 2.0** |
+| <capability, e.g. Text generation> | <model> | ✅ Confirmed / Medium / Low | **Doubao** |
+| <Image generation> | **Unknown** | ❓ | **Seedream 5.0 Pro** |
+| <Video generation> | **Unknown** | ❓ | **Seedance 2.5** |
+| <Speech / voice / TTS> | **Unknown** | ❓ | **Seed Audio 1.0** |
 | ... | | | |
 
 ---
@@ -210,11 +216,14 @@ Or is the relationship experimental and easily replaceable?>
 
 ### Opportunity Score
 
+> **Rationale format (required):** Cite the specific signal from research — product name, source, and date — then state the implication. Example: `"'Persona.Flow' lists LLM reasoning as core feature (product page, 2025-05); 8 ML Eng postings mention 'LLM API' (LinkedIn, 2025-06) → text model displacement opportunity; no exclusive vendor contract detected"`. Never write generic rationale without a source.
+
 | Model Segment | Score | Est. Monthly Volume | Rationale |
 |---|---|---|---|
-| **Text / Language Models** | H / M / L | <token estimate> | <why> |
-| **Image Generation** | H / M / L | <image estimate> | <why> |
-| **Video Generation** | H / M / L | <video min estimate> | <why> |
+| **Text / Language Models** (Doubao) | H / M / L | <token estimate> | <specific signal (source, date) → implication> |
+| **Image Generation** (Seedream 5.0 Pro) | H / M / L | <image estimate> | <specific signal (source, date) → implication> |
+| **Video Generation** (Seedance 2.5) | H / M / L | <video min estimate> | <specific signal (source, date) → implication> |
+| **Speech / Audio** (Seed Audio 1.0) | H / M / L | <voice min estimate> | <specific signal (source, date) → implication> |
 
 **Overall account priority:** Strategic / High / Medium / Low
 
@@ -222,9 +231,12 @@ Or is the relationship experimental and easily replaceable?>
 
 <Based on the opportunity assessment, which BytePlus products should we lead with?>
 
-1. **<Product Name>** — <why it fits their use case, specific to their situation>
-2. **<Product Name>** — <why>
-3. _(Optional) <Product Name>_ — <conditional: only if X is confirmed>
+> Name only current-roster models: **Seedance 2.5** (video), **Seedream 5.0 Pro** (image),
+> **Seed Audio 1.0** (speech/voice/dubbing), **Doubao** (text).
+
+1. **<Product Name>** — <why it fits: cite the specific signal from research> _(Source: <source, date>)_
+2. **<Product Name>** — <why, with evidence from research> _(Source: <source, date>)_
+3. _(Optional) **<Product Name>**_ — <conditional: only if X confirmed> _(Source: <source, date>)_
 
 ### Suggested Entry Points
 
@@ -245,61 +257,41 @@ Or is the relationship experimental and easily replaceable?>
 | <name> | <title> | Economic buyer / Technical eval / Champion | <notes> |
 | ... | | | |
 
-_Fill in from Apollo / LinkedIn / SA Wiki. Redact contact details._
+_Fill in from Apollo / LinkedIn. Redact contact details._
+
+### Pre-meeting Research Actions
+
+> _Complete these before the meeting. Each action is specific to this company and vertical._
+> _Note what you found (or mark [Not found]) — this determines which questions below to prioritize._
+
+- [ ] <Specific action 1 tailored to their vertical: e.g., "Check [product] pricing/docs page for API tier or rate limit mentions → signals current usage volume">
+- [ ] <Specific action 2: e.g., "Search '[company] + MAU OR monthly active users OR daily requests' for public scale signals">
+- [ ] <Specific action 3: e.g., "Review [N] ML engineer job postings for specific model/vendor mentions (LinkedIn)">
+- [ ] <Add 2–3 more actions specific to this company's vertical and research gaps>
+
+---
 
 ### AE Questions (Business Discovery)
 
-> _Goal: guide the customer to articulate their own challenges. Follow the consultative arc:_
-> _context → challenge → strategy → implication → natural bridge to BytePlus._
-> _Never open with the product. Earn the right to pitch._
+> _Ask only what research did not answer. Each question must reference a specific finding or gap._
 
-**Opening question (always first — entirely about their world):**
+1. "<Opening question referencing a specific product, news item, or signal from research — entirely about their world, not BytePlus>"
+2. "<Business model / growth question tailored to their vertical and stage>"
+3. "<AI cost or investment question — only if volume/spend was not surfaced by pre-meeting actions>"
+4. "<Decision process: 'Who else will be involved in evaluating this?'>"
+5. "<Closing: 'Before we wrap — is there anything about your situation we should understand that we didn't cover?'>"
 
-> "<Reference something from research — recent news, product launch, company milestone, or growth signal. Then ask an open question that invites them to talk about what's on their plate.>"
-> _e.g. "I saw you launched [X] last quarter — how has that changed what the team is focused on right now?"_
-
-**Consultative arc for this customer's business model:**
-
-1. **Context anchor** — show you understand their world:
-   "<Statement that reflects their business model reality — subscription cost pressure, catalog scale, content velocity, campaign volume, etc. Frame as empathy, not a question yet.>"
-
-2. **Challenge surface** — let them describe the friction:
-   "<Open question that invites them to name where things are hard — without you naming it for them.>"
-   _Why ask: <the gap this fills or the signal you're listening for>_
-
-3. **Strategy probe** — understand their current approach:
-   "<Question about how they're thinking about or handling the challenge today.>"
-   _Why ask: <understand their existing approach before positioning ours>_
-
-4. **Implication** — make the pain real and quantifiable:
-   "<Question that helps them articulate the business cost of the problem — slower growth, higher cost per user, missed revenue, competitive disadvantage.>"
-   _Why ask: <quantify the pain so the ROI story is their words, not ours>_
-
-**Natural bridge (spoken, not written in the doc):**
-_At this point the SA or AE introduces BytePlus as a natural answer to what the customer just described._
+---
 
 ### SA Questions (Technical Discovery)
 
-> _Goal: understand the product experience first, architecture second._
-> _Start with what the user experiences, then work backward to how it's built._
+> _Ask only what research did not answer. Start from user/product experience, not infrastructure._
 
-**Opening technical question:**
-
-> "Before I ask about your stack — can you walk me through the user experience you're trying to create? I find it's easier to think about the right technical approach once I understand what 'good' looks like from your user's perspective."
-
-**Must-ask technical questions for this customer:**
-
-1. <Start with user experience, not infrastructure: "Walk me through what happens when a user [does X in their product] — what's happening behind the scenes?">
-   _Why ask: <gets them to explain architecture naturally>_
-
-2. <Cost / scale question specific to their model and growth stage:>
-   _Why ask: <surfaces unit economics pain or capacity planning needs>_
-
-3. <Integration / migration question specific to their stack:>
-   _Why ask: <reveals technical complexity and switching cost>_
-
-4. <Evaluation criteria question — let them define success:>
-   _Why ask: <anchors the POC before you start>_
+1. "<User experience: 'Walk me through what a user experiences when [specific AI feature in their product] — what's happening under the hood?'>"
+2. "<Scale question — reference company size or MAU signal from research; only ask if volume still unclear after pre-meeting actions>"
+3. "<Stack / integration question — reference their known cloud provider or tech stack from research>"
+4. "<Evaluation: 'What would you need to see in a pilot to feel confident this works at your scale?'>"
+5. "<Closing: 'What feels like the most natural next step — a technical deep-dive or a small pilot first?'>"
 
 ### Conversation Starters & Icebreakers
 
@@ -320,7 +312,6 @@ _At this point the SA or AE introduces BytePlus as a natural answer to what the 
 | <domain>/careers | Website | AI hiring signals | <datetime> |
 | LinkedIn | Public page | Headcount, updates | <datetime> |
 | Web search | News | Funding, AI announcements | <datetime> |
-| SA Wiki | Internal knowledge | Prior engagement history | <datetime> |
 
 **Data freshness:** This prospection was generated on <DATE>. Web data may be up to 30 days stale for cached search results. Verify critical facts before the meeting.
 

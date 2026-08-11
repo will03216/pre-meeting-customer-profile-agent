@@ -41,6 +41,7 @@ to articulate their own pain, so the BytePlus solution feels like the obvious an
 - `[IMAGE-OPP]` — research signals image generation opportunity
 - `[VIDEO-OPP]` — research signals video generation opportunity
 - `[TEXT-OPP]` — research signals LLM/text opportunity
+- `[AUDIO-OPP]` — research signals speech/voice/dubbing opportunity
 - `[CHANNEL-PARTNER]` — prospect looks more like a reseller/integrator than direct buyer
 
 ---
@@ -303,6 +304,15 @@ _Purpose: Opens BytePlus data privacy differentiator; often a real concern they 
 
 `[VIDEO-OPP]`
 > "For video — is the goal generating new video from scratch, or transforming existing content (editing, style transfer, dubbing)? And what duration and resolution are you working with?"
+
+`[AUDIO-OPP]`
+> "On the voice side — is it narration over content you already have, or interactive speech where latency matters? And how many languages and distinct voices do you need to cover?"
+
+`[AUDIO-OPP]`
+> "When you've looked at synthetic voice before, what made it not good enough to ship — was it the naturalness, the language coverage, or the control over delivery and emotion?"
+
+_Purpose: Most teams tried TTS years ago and wrote it off. This surfaces the specific
+objection so Seed Audio 1.0 can be positioned against that objection rather than in general._
 
 ### Evaluation & POC
 

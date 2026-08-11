@@ -1,7 +1,7 @@
 ---
 name: polym-customer-prospect
 version: 0.1.0
-description: "Customer prospection for pre-meeting prep. Inputs: company name, company URL, contact name (all optional — missing info is never a hard blocker). Runs 5 parallel intelligence agents (Apollo, web enrichment, AI-news search, competitive scan, SA Wiki), synthesises findings, scores BytePlus model opportunity, generates tailored AE/SA meeting questions, writes a Lark prospection doc, and archives to SA Wiki."
+description: "Customer prospection for pre-meeting prep. Inputs: company name, company URL, contact name (all optional — missing info is never a hard blocker). Runs 4 parallel intelligence agents (Apollo, web enrichment, AI-news search, competitive scan), synthesises findings, scores BytePlus model opportunity, generates tailored AE/SA meeting questions, and writes a Lark prospection doc."
 metadata:
   requires:
     bins: ["lark-cli"]
@@ -9,8 +9,8 @@ metadata:
 
 # polym-customer-prospect — Customer Prospection Skill
 
-> **Depends on:** `polym-sa-wiki` (wiki read/write) · `lark-cli` (Lark doc creation)
-> **Optional env:** `APOLLO_API_KEY` · `PROSPECTS_FOLDER_TOKEN`
+> **Depends on:** `lark-cli` (Lark doc creation)
+> **Recommended env:** `APOLLO_API_KEY` (skill degrades gracefully without it)  ·  **Optional env:** `PROSPECTS_FOLDER_TOKEN`
 
 ## 1. When to Use This Skill
 
@@ -63,14 +63,13 @@ PARALLEL │ Agent A  Apollo enrichment                           │
          │ Agent B  Company website + domain scrape             │
          │ Agent C  AI news + LinkedIn + funding search         │
          │ Agent D  Competitive intelligence scan               │
-         │ Agent E  SA Wiki existing knowledge                  │
          └──────────────────────────────────────────────────────┘
          │
          ▼
 Phase 2: Synthesis — merge, fill gaps, mark unknowns
          │
          ▼
-Phase 3: BytePlus opportunity scoring (text / image / video)
+Phase 3: BytePlus opportunity scoring (text / image / video / audio)
          │
          ▼
 Phase 4: Generate tailored AE + SA meeting questions
@@ -79,20 +78,88 @@ Phase 4: Generate tailored AE + SA meeting questions
 Phase 5: Write Lark prospection document (always)
          │
          ▼
-Phase 6: Archive summary to SA Wiki write_queue (always)
-         │
-         ▼
 Return Lark doc URL to user
 ```
+
+---
+
+## 3.5 Phase −1 — Pre-flight Checks
+
+Run **before Phase 0**. Blocking checks must pass before proceeding; optional checks skip gracefully.
+
+### Check 1 — lark-cli (BLOCKING)
+
+```bash
+lark-cli --version 2>/dev/null || echo "NOT_INSTALLED"
+lark-cli auth status          # no flags needed — already emits JSON; never pass --as (rejected on auth)
+```
+
+Read `identities.user.status` from the output: `ready` (or `needs_refresh`, which auto-refreshes
+on the next call) means authenticated.
+
+**If lark-cli is not installed** (`command not found` / exit 127) → this is an *install* gap that
+the auth flow cannot fix. Fetch the official installation guide and follow the steps for the
+user's OS, then verify with `lark-cli --version` and return to the check above:
+
+```
+help me to install CLI：https://open.feishu.cn/document/no_class/mcp-archive/feishu-cli-installation-guide.md
+```
+
+Installation may need user approval (package manager / sudo / download) — surface the exact
+commands the user has to run; never assume success silently.
+
+**If installed but not authenticated** → run:
+
+```bash
+lark-cli auth login --domain docs,drive,wiki
+```
+
+`auth login` needs a scope selector — `--domain docs,drive,wiki` covers what this skill uses;
+`--recommend` requests only the auto-approved set. **`--as` is not a valid flag on any `auth`
+subcommand** — it selects identity on resource commands (`docs +fetch --as user`) only.
+Verified against lark-cli 1.0.85.
+For the non-blocking agent flow (`--no-wait` → show QR → `--device-code`), see
+`polym-customer-one-pager` SKILL.md §0.
+
+**If installed and authenticated → proceed.**
+
+---
+
+### Check 2 — Apollo API Key (NON-BLOCKING)
+
+Apollo adds company size, revenue, tech stack and the org-chart signal. It makes the profile
+much richer — but it is **never a reason to stop the run**. Agents B, C and D do not touch
+Apollo and must always proceed.
+
+```bash
+[ -n "$APOLLO_API_KEY" ] && echo "SET" || echo "NOT_SET"
+```
+
+**If set — verify it works, without blocking on the result:**
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "https://api.apollo.io/api/v1/organizations/enrich" \
+  -H "Content-Type: application/json" -H "X-Api-Key: $APOLLO_API_KEY" \
+  -d '{"domain":"stripe.com"}'    # expect 200
+```
+
+| Result | Action |
+|---|---|
+| `200` | Run Agent A normally. |
+| `401` / any non-200 | Agent A becomes a no-op. Tell the user once: *"Apollo key looks invalid (HTTP `<code>`) — continuing without Apollo enrichment."* Then **proceed with Agents B/C/D.** |
+| Not set | Agent A becomes a no-op. Tell the user once: *"APOLLO_API_KEY is not set — continuing without Apollo enrichment. To enable it: `export APOLLO_API_KEY=<your-key>`, then reopen the terminal."* Then **proceed with Agents B/C/D.** |
+
+**Never stop the pipeline over Apollo.** When Agent A is a no-op, record
+`[Apollo: skipped — <reason>]` in the Sources section and carry that into Phase 2 (see the
+degradation rules there).
 
 ---
 
 ## 4. Phase 0 — Input Parsing & Config
 
 ```bash
-# Check Apollo key
+# Apollo key (optional — empty means Agent A is skipped, the run still proceeds)
 APOLLO_KEY="${APOLLO_API_KEY:-}"
-[ -z "$APOLLO_KEY" ] && echo "[WARN] APOLLO_API_KEY not set — Apollo enrichment will be skipped"
 
 # Check Lark folder for prospection docs
 PROSPECTS_FOLDER="${PROSPECTS_FOLDER_TOKEN:-}"
@@ -111,39 +178,54 @@ DOMAIN=$(echo "$company_url" | sed 's|https\?://||;s|www\.||;s|/.*||')
 
 ## 5. Phase 1 — Parallel Intelligence Gathering
 
-**CRITICAL: Launch all 5 agents in a single `Agent(...)` batch (same message).** Do not run sequentially.
+**CRITICAL: Launch all 4 agents in a single `Agent(...)` batch (same message).** Do not run sequentially.
 
 ### Agent A — Apollo Organization + People Enrichment
 
 See [`references/apollo-workflow.md`](references/apollo-workflow.md) for full API details.
 
+**Auth: the API key MUST go in the `X-Api-Key` header.** Passing `api_key` in the request body is rejected with `422 INVALID_API_KEY_LOCATION`.
+
 ```bash
 # Organization enrichment
 curl -s -X POST "https://api.apollo.io/api/v1/organizations/enrich" \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $APOLLO_KEY" \
   -H "Cache-Control: no-cache" \
-  -d "{\"api_key\": \"$APOLLO_KEY\", \"domain\": \"$DOMAIN\"}"
+  -d "{\"domain\": \"$DOMAIN\"}"
 
 # People/contacts at the company (focus: CTO, Head of AI, Engineering VP, Procurement)
-curl -s -X POST "https://api.apollo.io/api/v1/mixed_people/search" \
+# NOTE: endpoint is mixed_people/api_search — the old mixed_people/search returns 422 (deprecated).
+# NOTE: the domain filter param is q_organization_domains_list. Using organization_domains
+#       is SILENTLY IGNORED and returns people from unrelated companies.
+curl -s -X POST "https://api.apollo.io/api/v1/mixed_people/api_search" \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $APOLLO_KEY" \
   -d "{
-    \"api_key\": \"$APOLLO_KEY\",
-    \"organization_domains\": [\"$DOMAIN\"],
+    \"q_organization_domains_list\": [\"$DOMAIN\"],
     \"person_titles\": [\"CTO\",\"Chief AI Officer\",\"VP Engineering\",\"Head of AI\",\"ML Lead\",\"Procurement\"],
     \"page\": 1,
     \"per_page\": 10
   }"
 ```
 
+**Sanity check the people response before using it:** every returned person's `organization.name` must match the target company. If `total_entries` is in the thousands, the domain filter did not apply — discard the result rather than writing unrelated contacts into the doc.
+
 **Extract from Apollo response:**
 - Company size (employees), revenue estimate, industry, founded year, HQ location
-- Technology stack (`technologies` field — critical for AI tool detection)
+- Technology stack (`technology_names` field — critical for AI tool detection; the older
+  `technologies` field is no longer returned and will silently read as empty)
 - LinkedIn URL, Twitter, Crunchbase
-- Key contacts: name, title, LinkedIn, email (redact email in wiki write)
+- Key contacts: title + `first_name` (see masking note below)
 - Funding info if available
 
-**If `APOLLO_KEY` is empty:** skip this agent, note `[Apollo: skipped — API key not configured]` in output.
+**Contact masking:** on most API tiers the people search returns `name`, `last_name`,
+`linkedin_url`, `seniority` and `email` as `null` — only `title`, `first_name` and the
+`has_email` / `has_direct_phone` booleans are populated. Treat Apollo contacts as a
+*title-distribution signal* (who exists in the org chart), not as a named contact list.
+Named decision-makers must come from Agent B/C via public LinkedIn pages.
+
+**If `APOLLO_KEY` is empty, or a call fails at runtime:** skip this agent, note `[Apollo: skipped — <reason>]` in the Sources section, and let the other agents finish. Do not stop the run and do not retry more than once.
 
 ---
 
@@ -245,44 +327,24 @@ searches = [
 
 ---
 
-### Agent E — SA Wiki Existing Knowledge
-
-Use `polym-sa-wiki` skill READ workflow (3-source parallel: Wiki + Lark messages + BytePlus docs).
-
-```bash
-# Check if customer already exists in wiki
-lark-cli base +record-search --base-token $BASE_TOKEN --table-id $KI_TABLE \
-  --json "{\"keyword\":\"$company_name\",\"page_size\":10}" --format json --as user
-
-# If found — fetch PROFILE and TIMELINE
-lark-cli docs +fetch --api-version v2 --doc <profile_doc_token> --as user
-lark-cli docs +fetch --api-version v2 --doc <timeline_doc_token> --as user
-
-# Also search Lark messages for recent discussions
-# (handled by polym-sa-wiki Agent 2 sub-agent)
-```
-
-**Extract:**
-- Prior engagement history (meetings, POC status, issues)
-- Known contacts at the customer
-- Previous BytePlus proposals or demos
-- Outstanding issues or blockers
-- SA team's current assessment of the relationship
-
----
-
 ## 6. Phase 2 — Synthesis
 
 > **LANGUAGE RULE (non-negotiable): The final prospection document MUST be written entirely in English — all section titles, table content, narrative text, meeting questions, and bullet points. The only exception is quoted company names, brand names, or proper nouns that are inherently non-English (e.g., "火山引擎" → "Volcengine / 火山引擎"). The user's conversation language does NOT affect the output language.**
 
-After all 5 agents return, merge into a unified profile. Rules:
+After all 4 agents return, merge into a unified profile. Rules:
 
-1. **Conflict resolution**: Apollo data > Website > Web search > Wiki (for company facts). Wiki > all for engagement history.
+1. **Conflict resolution** (for company facts): Apollo data > Website > Web search. When Apollo is unavailable, Website becomes the primary source.
 2. **Gap marking**: Any field with no data across all sources → write `[Not found]`. Never hallucinate.
-3. **Confidence scoring**: For each key claim, note source in parentheses: `(Apollo)`, `(Website)`, `(LinkedIn)`, `(Web search)`, `(SA Wiki)`.
+3. **Confidence scoring**: For each key claim, note source in parentheses: `(Apollo)`, `(Website)`, `(LinkedIn)`, `(Web search)`.
 4. **Dedup**: If multiple sources say the same thing, cite the most authoritative.
 5. **AI usage flagging**: If any source mentions a competitor's AI product → flag prominently in Competitive Landscape section.
 6. **Third-party reseller check**: If customer uses AWS Bedrock / Azure OpenAI / Google Vertex → note "may already access our models via [platform]; confirm which models".
+7. **Apollo-skipped degradation**: When Agent A was a no-op, still produce the full document. Specifically:
+   - Company size / revenue / founded year / funding → fill from Website and Web search, else `[Not found]`.
+   - The Apollo-derived tech-stack signal is gone → build the AI Stack section from the careers page, engineering blog and news signals only, and lower every affected confidence to `Low` or `Medium`.
+   - Contacts → derive from public LinkedIn pages via Agent C; do not leave the section empty.
+   - Add one line at the top of the Sources section: `[Apollo: skipped — <reason>] — company firmographics and tech-stack confidence are reduced.`
+   - Opportunity scores are still produced, but note in the rationale where the evidence is thinner than usual.
 
 ---
 
@@ -290,29 +352,41 @@ After all 5 agents return, merge into a unified profile. Rules:
 
 Score each model segment **High / Medium / Low** with rationale. See scoring rubric in [`references/web-enrichment-workflow.md`](references/web-enrichment-workflow.md) §5.
 
+**Which model to name:** always take the model name from the **Current Model Roster** table at
+the top of [`references/web-enrichment-workflow.md`](references/web-enrichment-workflow.md) §5 —
+currently **Seedance 2.5** (video), **Seedream 5.0 Pro** (image), **Seed Audio 1.0** (speech/audio),
+**Doubao** (text). Never lead with a superseded model.
+
 **Quick heuristics:**
 
-| Signal | Text/LLM | Image | Video |
-|--------|-----------|-------|-------|
-| Customer service / support platform | High | Low | Low |
-| E-commerce / retail | Medium | High | High |
-| Media / content / entertainment | Medium | Medium | High |
-| Gaming | Low | High | High |
-| Fintech / banking | High | Low | Low |
-| Healthcare | High | Low | Low |
-| Marketing / advertising | High | High | High |
-| SaaS / developer tools | High | Low | Low |
-| Education / EdTech | High | Medium | Medium |
-| Active AI product (LLM API buyer) | High | Medium | Low |
-| Job postings for ML/AI roles | +1 level across all | | |
-| Recent AI funding round | +1 level across all | | |
-| Confirmed competitor usage | note lock-in risk | | |
+| Signal | Text/LLM | Image | Video | Audio |
+|--------|-----------|-------|-------|-------|
+| Customer service / support platform | High | Low | Low | High |
+| E-commerce / retail | Medium | High | High | Medium |
+| Media / content / entertainment | Medium | Medium | High | High |
+| Gaming | Low | High | High | High |
+| Fintech / banking | High | Low | Low | Medium |
+| Healthcare | High | Low | Low | Medium |
+| Marketing / advertising | High | High | High | High |
+| SaaS / developer tools | High | Low | Low | Low |
+| Education / EdTech | High | Medium | Medium | High |
+| Active AI product (LLM API buyer) | High | Medium | Low | Medium |
+| Multi-language product or localisation effort | Medium | Low | Medium | High |
+| Job postings for ML/AI roles | +1 level across all | | | |
+| Recent AI funding round | +1 level across all | | | |
+| Confirmed competitor usage | note lock-in risk | | | |
 
-**Volume estimate** (monthly tokens / images / video minutes) — use company size + industry as proxy:
+**Volume estimate** (monthly tokens / images / video minutes / voice minutes) — use company size + industry as proxy:
 - < 100 employees → seed / early: Low volume
 - 100–1000 employees → growth: Medium volume
 - 1000+ employees, consumer product → High volume
 - Add LinkedIn headcount trend (growing = higher volume trajectory)
+
+**Rationale writing rule:** Each rationale cell must cite the specific evidence found in research — product name, source, and date. Format: `<signal> (<source>, <date>) → <implication>`. Never write a generic inference without a source.
+- ✅ GOOD: `"Product 'X' homepage lists 'LLM reasoning' as core feature (website, 2025-05); 8 ML Eng job postings mention 'LLM API' (LinkedIn, 2025-06) → text model displacement opportunity; no exclusive vendor confirmed"`
+- ❌ BAD: `"AEO services need LLMs; Doubao could serve non-Google workflows"`
+
+The same sourcing rule applies to **Recommended BytePlus Solutions**: every recommendation must cite the specific signal or product finding that justifies it, with source.
 
 ---
 
@@ -341,21 +415,44 @@ so BytePlus solutions emerge as the obvious answer — not as a pitch.
 **Step 2 — Layer situation-specific follow-ups:**
 - AI stack unknown → add `[AI-UNKNOWN]` probes
 - Competitor detected → add `[COMPETITOR-PRESENT]` questions (frame neutrally, not aggressively)
-- Image/video/text opportunity scored High → add the corresponding `[IMAGE-OPP]`/`[VIDEO-OPP]`/`[TEXT-OPP]` probes
+- Image/video/text/audio opportunity scored High → add the corresponding `[IMAGE-OPP]`/`[VIDEO-OPP]`/`[TEXT-OPP]`/`[AUDIO-OPP]` probes
 
-**Step 3 — Always include:**
-- 1 opening question that is entirely about their world, not BytePlus
-- 2–3 AE business questions following the arc for their business model
-- 3–5 SA technical questions starting from user experience, not architecture
-- 2 closing questions (always the same — surface hidden context + co-create next step)
+**Step 3 — Output format (non-negotiable):**
 
-**Step 4 — Make every question specific.** Reference something found in research:
-- Generic (BAD): "Are you using any AI tools?"
-- Generic (BAD): "What are your AI goals?"
-- Specific (GOOD): "Your careers page has 12 ML engineer openings — I'm curious what that team is building. Is that for a new product feature, or scaling something already in production?"
-- Specific (GOOD): "You launched [product] six months ago. As that's ramped up, has the AI cost structure started to become a real line item, or is usage still light enough that it's not on the radar yet?"
+The Meeting Preparation section in the Lark doc must follow this structure, in this order:
 
-**Questions to avoid:** See "Questions to Avoid" section in the bank — especially: never open with the product, never ask for budget directly in the first 10 minutes, never ask "are you aware of BytePlus?"
+**Block 1 — Pre-meeting Research Actions** (3–6 items, vertical-specific)
+Actions the SA/AE completes *before* the meeting — things resolvable without being in the room.
+Format: `- [ ] <specific action> → [finding or Not found]`
+Actions must be tailored to this company's vertical and the gaps left after Phase 1–2.
+Examples by vertical:
+- AI tools company: `[ ] Check product docs / pricing page for API tier or rate limit mentions → signals current usage volume`
+- E-commerce: `[ ] Count active product categories on catalog page → signals PDP content scale`
+- Media/gaming: `[ ] Search "[company] + content production OR AI pipeline" on engineering blog`
+- Any: `[ ] Search "[company] + MAU OR monthly active OR daily requests" for public scale signals`
+
+**Block 2 — AE Questions** (3–5 items)
+Only questions that the pre-meeting research did NOT answer.
+Numbered list. No arc labels (① ② ③). No "Why ask" or "Purpose" annotations.
+Each question must reference a specific finding or gap from research.
+
+**Block 3 — SA Questions** (3–5 items)
+Only questions that the pre-meeting research did NOT answer.
+Numbered list. No "Why ask" or "Purpose" annotations.
+Start from user/product experience, not infrastructure.
+
+**Block 4 — Conversation Starters** (2–3 items)
+Non-sales openers referencing specific findings: recent news, product launch, ML job postings.
+
+**Step 4 — Question specificity rule:**
+Every question and action must be specific to this company. If it could apply to any company in any industry, rewrite it.
+- ❌ NEVER: "Are you using any AI tools?" / "What are your AI goals?"
+- ✅ ALWAYS: "Your careers page has [exact N from research] ML engineer openings — what's that team building?" (cite the count found)
+- ✅ ALWAYS: "You launched [Product X found in research] in [month] — has AI cost become a real line item since then?"
+
+**Never write "Why ask" or "Purpose" annotations in the output document.**
+
+**Questions to avoid:** never open with the product, never ask for budget directly in the first 10 minutes, never ask "are you aware of BytePlus?"
 
 ---
 
@@ -373,18 +470,26 @@ cat > ./prospect_content.md << 'EOF'
 EOF
 
 # Step 2: create the document
+# MUST pass --api-version v2. The v1 interface is shut down, and v1-only flags are rejected:
+#   --markdown       → use --content with --doc-format markdown
+#   --folder-token   → use --parent-token
 lark-cli docs +create \
+  --api-version v2 \
   --title "$DOC_TITLE" \
-  ${PROSPECTS_FOLDER:+--folder-token "$PROSPECTS_FOLDER"} \
-  --markdown "@prospect_content.md" \
+  ${PROSPECTS_FOLDER:+--parent-token "$PROSPECTS_FOLDER"} \
+  --content "@prospect_content.md" \
+  --doc-format markdown \
   --as user
 # → returns doc_id (doc_token) and doc_url
 
-# Step 3: if content is too large for +create, use +update --mode overwrite after creation
+# Step 3: if content is too large for +create, overwrite after creation.
+# Note: v2 uses --command overwrite, not --mode overwrite (v1-only, rejected).
 lark-cli docs +update \
+  --api-version v2 \
   --doc "<doc_id_from_create>" \
-  --mode overwrite \
-  --markdown "@prospect_content.md" \
+  --command overwrite \
+  --content "@prospect_content.md" \
+  --doc-format markdown \
   --as user
 
 rm ./prospect_content.md
@@ -417,7 +522,7 @@ After doc creation, immediately respond with:
 Key findings:
 • <top 3 bullets from Executive Summary>
 
-Opportunity: Text [H/M/L] · Image [H/M/L] · Video [H/M/L]
+Opportunity: Text [H/M/L] · Image [H/M/L] · Video [H/M/L] · Audio [H/M/L]
 ```
 
 ## 10. References
